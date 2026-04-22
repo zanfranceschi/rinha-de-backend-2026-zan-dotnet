@@ -1,0 +1,72 @@
+@port = 9999
+
+### Health check
+GET http://localhost:{{port}}/ready
+
+###
+
+### Fraud score
+POST http://localhost:{{port}}/fraud-score
+Content-Type: application/json
+
+{
+    "id": "tx-001",
+    "transaction": {
+        "amount": 50.0,
+        "installments": 1,
+        "requested_at": "2026-03-16T14:00:00Z"
+    },
+    "customer": {
+        "avg_amount": 60.0,
+        "tx_count_24h": 2,
+        "known_merchants": ["MERC-001"]
+    },
+    "merchant": {
+        "id": "MERC-001",
+        "mcc": "5411",
+        "avg_amount": 45.0
+    },
+    "terminal": {
+        "is_online": false,
+        "card_present": true,
+        "km_from_home": 2.0
+    },
+    "last_transaction": {
+        "timestamp": "2026-03-16T12:00:00Z",
+        "km_from_current": 1.5
+    }
+}
+
+###
+
+### Fraud score (fraudulent)
+POST http://localhost:{{port}}/fraud-score
+Content-Type: application/json
+
+{
+    "id": "tx-fraud",
+    "transaction": {
+        "amount": 9500.0,
+        "installments": 12,
+        "requested_at": "2026-03-14T03:00:00Z"
+    },
+    "customer": {
+        "avg_amount": 200.0,
+        "tx_count_24h": 15,
+        "known_merchants": ["MERC-001"]
+    },
+    "merchant": {
+        "id": "MERC-999",
+        "mcc": "7995",
+        "avg_amount": 8000.0
+    },
+    "terminal": {
+        "is_online": true,
+        "card_present": false,
+        "km_from_home": 500.0
+    },
+    "last_transaction": {
+        "timestamp": "2026-03-14T02:55:00Z",
+        "km_from_current": 300.0
+    }
+}

@@ -1,0 +1,30 @@
+.claude
+.env
+
+# Build results
+bin/
+obj/
+publish/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# VS Code
+.vscode/
+
+# Rider
+.idea/
+
+# NuGet
+*.nupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+# OS files
+.DS_Store
+Thumbs.db
+resources/references.bin
+resources/references.json.gz
