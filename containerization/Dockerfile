@@ -10,6 +10,5 @@ FROM alpine:3.21
 WORKDIR /app
 COPY --from=builder /app/publish/rinha2026 .
 COPY resources/references.bin resources/mcc_risk.json resources/normalization.json /resources/
-EXPOSE 3000
 ENV RESOURCES_PATH=/resources
 CMD ["./rinha2026"]

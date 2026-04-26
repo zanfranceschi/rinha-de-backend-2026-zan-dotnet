@@ -3,6 +3,7 @@ using Rinha2026.Models;
 
 namespace Rinha2026;
 
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(FraudRequest))]
 [JsonSerializable(typeof(FraudResponse))]
 [JsonSerializable(typeof(Dictionary<string, double>))]

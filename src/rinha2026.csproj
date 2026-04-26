@@ -6,6 +6,25 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- AOT codegen: target Haswell (AVX2, FMA, BMI1/2, POPCNT, F16C). -->
+    <IlcInstructionSet>avx2</IlcInstructionSet>
+    <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
+    <OptimizationPreference>Speed</OptimizationPreference>
+
+    <!-- Runtime tuning -->
+    <TieredCompilation>false</TieredCompilation>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+
+    <!-- Strip unused metadata for smaller / faster binary -->
+    <DebuggerSupport>false</DebuggerSupport>
+    <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
+    <EventSourceSupport>false</EventSourceSupport>
+    <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
+    <MetricsSupport>false</MetricsSupport>
+    <StackTraceSupport>false</StackTraceSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
   </PropertyGroup>
 
 </Project>

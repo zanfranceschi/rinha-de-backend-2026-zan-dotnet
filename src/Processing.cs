@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Text.Json;
 using Rinha2026.Models;
@@ -7,9 +8,14 @@ namespace Rinha2026.Services;
 
 public class DataLoader
 {
+    public const int Scale = 8192;
+    public const int Stride = 16; // 14 dims + 2 pad
+
     public Dictionary<string, double> MccRisk { get; }
     public NormalizationConfig Normalization { get; }
-    public List<Reference> References { get; }
+    public short[] References { get; } // flat: count * Stride shorts
+    public byte[] Labels { get; }       // 1 = fraud, 0 = legit
+    public int Count { get; }
 
     public DataLoader(string resourcesPath)
     {
@@ -22,121 +28,156 @@ public class DataLoader
             AppJsonContext.Default.NormalizationConfig)!;
 
         using var br = new BinaryReader(File.OpenRead(Path.Combine(resourcesPath, "references.bin")));
-        var count = br.ReadInt32();
-        References = new List<Reference>(count);
-        for (int i = 0; i < count; i++)
-        {
-            var vector = new double[14];
-            for (int d = 0; d < 14; d++)
-                vector[d] = br.ReadDouble();
-            var label = br.ReadByte() == 1 ? "fraud" : "legit";
-            References.Add(new Reference(vector, label));
-        }
+        Count = br.ReadInt32();
+        References = GC.AllocateUninitializedArray<short>(Count * Stride, pinned: true);
+        var refBytes = MemoryMarshal.AsBytes(References.AsSpan());
+        br.Read(refBytes);
+        Labels = br.ReadBytes(Count);
     }
 }
 
 public static class Vectorizer
 {
-    public static double[] Vectorize(FraudRequest req, NormalizationConfig norm, Dictionary<string, double> mccRisk)
-    {
-        var vector = new double[14];
+    private static readonly short[] HourLut = BuildLut(24, 23.0);
+    private static readonly short[] DowLut = BuildLut(7, 6.0);
 
-        var requestedAt = DateTime.Parse(req.Transaction.RequestedAt).ToUniversalTime();
+    private static short[] BuildLut(int n, double divisor)
+    {
+        var arr = new short[n];
+        for (int i = 0; i < n; i++)
+            arr[i] = (short)Math.Round(i / divisor * DataLoader.Scale);
+        return arr;
+    }
+
+    // Fixed format: "YYYY-MM-DDTHH:MM:SSZ" (20 chars). No allocs, no culture lookup.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static DateTime ParseIsoUtc(string s)
+    {
+        int y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+        int M = (s[5] - '0') * 10 + (s[6] - '0');
+        int d = (s[8] - '0') * 10 + (s[9] - '0');
+        int h = (s[11] - '0') * 10 + (s[12] - '0');
+        int m = (s[14] - '0') * 10 + (s[15] - '0');
+        int sec = (s[17] - '0') * 10 + (s[18] - '0');
+        return new DateTime(y, M, d, h, m, sec, DateTimeKind.Utc);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Vectorize(FraudRequest req, NormalizationConfig norm,
+        Dictionary<string, double> mccRisk, Span<short> output)
+    {
+        // output is at least 16 shorts; lanes 14,15 left as zero pad (caller pre-zeros).
+        var requestedAt = ParseIsoUtc(req.Transaction.RequestedAt);
         var dow = ((int)requestedAt.DayOfWeek + 6) % 7;
 
-        vector[0] = Clamp(req.Transaction.Amount / norm.MaxAmount);
-        vector[1] = Clamp(req.Transaction.Installments / norm.MaxInstallments);
-        vector[2] = Clamp((req.Transaction.Amount / req.Customer.AvgAmount) / norm.AmountVsAvgRatio);
-        vector[3] = requestedAt.Hour / 23.0;
-        vector[4] = dow / 6.0;
+        output[0] = Q(Clamp(req.Transaction.Amount / norm.MaxAmount));
+        output[1] = Q(Clamp(req.Transaction.Installments / norm.MaxInstallments));
+        output[2] = Q(Clamp((req.Transaction.Amount / req.Customer.AvgAmount) / norm.AmountVsAvgRatio));
+        output[3] = HourLut[requestedAt.Hour];
+        output[4] = DowLut[dow];
 
         if (req.LastTransaction is not null)
         {
-            var lastTs = DateTime.Parse(req.LastTransaction.Timestamp).ToUniversalTime();
+            var lastTs = ParseIsoUtc(req.LastTransaction.Timestamp);
             var minutes = (requestedAt - lastTs).TotalMinutes;
-            vector[5] = Clamp(minutes / norm.MaxMinutes);
-            vector[6] = Clamp(req.LastTransaction.KmFromCurrent / norm.MaxKm);
+            output[5] = Q(Clamp(minutes / norm.MaxMinutes));
+            output[6] = Q(Clamp(req.LastTransaction.KmFromCurrent / norm.MaxKm));
         }
         else
         {
-            vector[5] = -1;
-            vector[6] = -1;
+            output[5] = (short)-DataLoader.Scale;
+            output[6] = (short)-DataLoader.Scale;
         }
 
-        vector[7] = Clamp(req.Terminal.KmFromHome / norm.MaxKm);
-        vector[8] = Clamp(req.Customer.TxCount24h / norm.MaxTxCount24h);
-        vector[9] = req.Terminal.IsOnline ? 1 : 0;
-        vector[10] = req.Terminal.CardPresent ? 1 : 0;
-        vector[11] = req.Customer.KnownMerchants.Contains(req.Merchant.Id) ? 0 : 1;
-        vector[12] = mccRisk.GetValueOrDefault(req.Merchant.Mcc, 0.5);
-        vector[13] = Clamp(req.Merchant.AvgAmount / norm.MaxMerchantAvgAmount);
-
-        return vector;
+        output[7] = Q(Clamp(req.Terminal.KmFromHome / norm.MaxKm));
+        output[8] = Q(Clamp(req.Customer.TxCount24h / norm.MaxTxCount24h));
+        output[9] = req.Terminal.IsOnline ? (short)DataLoader.Scale : (short)0;
+        output[10] = req.Terminal.CardPresent ? (short)DataLoader.Scale : (short)0;
+        output[11] = req.Customer.KnownMerchants.Contains(req.Merchant.Id) ? (short)0 : (short)DataLoader.Scale;
+        output[12] = Q(mccRisk.GetValueOrDefault(req.Merchant.Mcc, 0.5));
+        output[13] = Q(Clamp(req.Merchant.AvgAmount / norm.MaxMerchantAvgAmount));
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static double Clamp(double x) => Math.Clamp(x, 0.0, 1.0);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static short Q(double v)
+    {
+        var q = Math.Round(v * DataLoader.Scale);
+        if (q > short.MaxValue) q = short.MaxValue;
+        if (q < short.MinValue) q = short.MinValue;
+        return (short)q;
+    }
 }
 
 public class FraudDetector
 {
     private readonly DataLoader _data;
+    public static readonly byte[][] PrecomputedResponses = BuildResponses();
 
     public FraudDetector(DataLoader data)
     {
         _data = data;
     }
 
-    public FraudResponse Evaluate(FraudRequest req)
+    private static byte[][] BuildResponses()
     {
-        var vector = Vectorizer.Vectorize(req, _data.Normalization, _data.MccRisk);
-        var neighbors = FindNearest(vector, 5);
-        var fraudCount = neighbors.Count(r => r.Label == "fraud");
-        var score = (double)fraudCount / neighbors.Count;
-        return new FraudResponse(score < 0.6, score);
+        var arr = new byte[6][];
+        for (int n = 0; n <= 5; n++)
+        {
+            var score = n / 5.0;
+            var resp = new FraudResponse(score < 0.6, score);
+            arr[n] = JsonSerializer.SerializeToUtf8Bytes(resp, AppJsonContext.Default.FraudResponse);
+        }
+        return arr;
     }
 
-    private List<Reference> FindNearest(double[] query, int k)
+    public int FraudCount(FraudRequest req)
     {
-        var topDists = new double[k];
-        var topRefs = new Reference[k];
-        Array.Fill(topDists, double.MaxValue);
+        Span<short> query = stackalloc short[DataLoader.Stride];
+        Vectorizer.Vectorize(req, _data.Normalization, _data.MccRisk, query);
+        return CountFraudNeighbors(query, 5);
+    }
 
-        foreach (var r in _data.References)
+    private int CountFraudNeighbors(Span<short> query, int k)
+    {
+        Span<int> topDists = stackalloc int[5];
+        Span<byte> topLabels = stackalloc byte[5];
+        for (int i = 0; i < k; i++) topDists[i] = int.MaxValue;
+
+        var refs = _data.References;
+        var labels = _data.Labels;
+        var count = _data.Count;
+        var qVec = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(query));
+
+        var bound = int.MaxValue;
+        ref var refBase = ref MemoryMarshal.GetArrayDataReference(refs);
+
+        for (int idx = 0; idx < count; idx++)
         {
-            var dist = EuclideanDistance(query, r.Vector);
-            if (dist >= topDists[k - 1])
-                continue;
+            var rVec = Vector256.LoadUnsafe(ref refBase, (nuint)(idx * DataLoader.Stride));
+            var diff = qVec - rVec;
+            var (lo, hi) = Vector256.Widen(diff);
+            var sq = lo * lo + hi * hi;
+            var dist = Vector256.Sum(sq);
+
+            if (dist >= bound) continue;
 
             int i = k - 2;
             while (i >= 0 && topDists[i] > dist)
             {
                 topDists[i + 1] = topDists[i];
-                topRefs[i + 1] = topRefs[i];
+                topLabels[i + 1] = topLabels[i];
                 i--;
             }
             topDists[i + 1] = dist;
-            topRefs[i + 1] = r;
+            topLabels[i + 1] = labels[idx];
+            bound = topDists[k - 1];
         }
 
-        return new List<Reference>(topRefs);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static double EuclideanDistance(double[] a, double[] b)
-    {
-        // 14 doubles: 3x Vector256<double> (4 each = 12) + 2 scalar
-        ref var ra = ref a[0];
-        ref var rb = ref b[0];
-
-        var v0 = Vector256.LoadUnsafe(ref ra, 0) - Vector256.LoadUnsafe(ref rb, 0);
-        var v1 = Vector256.LoadUnsafe(ref ra, 4) - Vector256.LoadUnsafe(ref rb, 4);
-        var v2 = Vector256.LoadUnsafe(ref ra, 8) - Vector256.LoadUnsafe(ref rb, 8);
-
-        var sum = v0 * v0 + v1 * v1 + v2 * v2;
-        var result = Vector256.Sum(sum);
-
-        var d12 = a[12] - b[12];
-        var d13 = a[13] - b[13];
-        return result + d12 * d12 + d13 * d13;
+        int fraudCount = 0;
+        for (int i = 0; i < k; i++) fraudCount += topLabels[i];
+        return fraudCount;
     }
 }

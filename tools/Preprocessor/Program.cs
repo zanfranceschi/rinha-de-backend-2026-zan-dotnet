@@ -43,21 +43,41 @@ else
     legitCentroids = legit.ToArray();
 }
 
-// Write binary format: [int32 count][per ref: 14 doubles + 1 byte label (1=fraud, 0=legit)]
+// Write binary format v2 (quantized i16, scale 8192):
+// [int32 count]
+// [count * 16 shorts: 14 quantized dims + 2 zero pads each]
+// [count bytes: label (1=fraud, 0=legit)]
+const int Scale = 8192;
+const int Stride = 16; // 14 dims + 2 pad
+
+short Quantize(double v)
+{
+    var q = Math.Round(v * Scale);
+    if (q > short.MaxValue) q = short.MaxValue;
+    if (q < short.MinValue) q = short.MinValue;
+    return (short)q;
+}
+
 var outputPath = Path.Combine(resourcesPath, "references.bin");
+var total = fraudCentroids.Length + legitCentroids.Length;
 using (var bw = new BinaryWriter(File.Create(outputPath)))
 {
-    bw.Write(fraudCentroids.Length + legitCentroids.Length);
-    foreach (var c in fraudCentroids)
+    bw.Write(total);
+
+    void WriteVecs(double[][] vecs)
     {
-        foreach (var d in c) bw.Write(d);
-        bw.Write((byte)1);
+        foreach (var c in vecs)
+        {
+            for (int i = 0; i < 14; i++) bw.Write(Quantize(c[i]));
+            bw.Write((short)0);
+            bw.Write((short)0);
+        }
     }
-    foreach (var c in legitCentroids)
-    {
-        foreach (var d in c) bw.Write(d);
-        bw.Write((byte)0);
-    }
+    WriteVecs(fraudCentroids);
+    WriteVecs(legitCentroids);
+
+    foreach (var _ in fraudCentroids) bw.Write((byte)1);
+    foreach (var _ in legitCentroids) bw.Write((byte)0);
 }
 var fileSize = new FileInfo(outputPath).Length;
 Console.WriteLine($"Written {fraudCentroids.Length + legitCentroids.Length} references to {outputPath} ({fileSize} bytes)");

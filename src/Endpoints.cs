@@ -9,7 +9,15 @@ public static class Endpoints
     {
         app.MapGet("/ready", () => Results.Ok());
 
-        app.MapPost("/fraud-score", (FraudRequest req, FraudDetector detector) =>
-            Results.Ok(detector.Evaluate(req)));
+        app.MapPost("/fraud-score", async (FraudRequest req, FraudDetector detector, HttpContext ctx) =>
+        {
+            var fraudCount = detector.FraudCount(req);
+            var payload = FraudDetector.PrecomputedResponses[fraudCount];
+
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "application/json";
+            ctx.Response.ContentLength = payload.Length;
+            await ctx.Response.Body.WriteAsync(payload);
+        });
     }
 }

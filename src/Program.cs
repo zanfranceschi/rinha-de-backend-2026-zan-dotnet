@@ -6,6 +6,13 @@ var builder = WebApplication.CreateSlimBuilder(args);
 builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
 
+var socketPath = Environment.GetEnvironmentVariable("SOCKET_PATH");
+if (!string.IsNullOrEmpty(socketPath))
+{
+    if (File.Exists(socketPath)) File.Delete(socketPath);
+    builder.WebHost.ConfigureKestrel(k => k.ListenUnixSocket(socketPath));
+}
+
 var resourcesPath = Environment.GetEnvironmentVariable("RESOURCES_PATH")
     ?? Path.Combine(AppContext.BaseDirectory, "..", "resources");
 
@@ -16,5 +23,17 @@ builder.Services.AddSingleton<FraudDetector>();
 var app = builder.Build();
 
 Endpoints.Map(app);
+
+if (!string.IsNullOrEmpty(socketPath))
+{
+    app.Lifetime.ApplicationStarted.Register(() =>
+    {
+        if (File.Exists(socketPath))
+            File.SetUnixFileMode(socketPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+    });
+}
 
 app.Run();
