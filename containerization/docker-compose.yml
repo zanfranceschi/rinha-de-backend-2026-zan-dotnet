@@ -1,5 +1,6 @@
 x-api: &api
   image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:latest
+  platform: linux/amd64
   volumes:
     - sock:/run/sock
   deploy:
@@ -23,6 +24,7 @@ services:
 
   nginx:
     image: nginx:alpine
+    platform: linux/amd64
     ports:
       - "9999:9999"
     volumes:

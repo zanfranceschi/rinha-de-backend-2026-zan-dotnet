@@ -7,6 +7,12 @@
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
 
+    <!-- Pin codegen target to x86_64 / linux-musl-x64. AVX2 below already implies
+         x86_64, but these declarations make the architecture explicit and prevent
+         accidental arm64 publishes from a Mac/Linux ARM host. -->
+    <RuntimeIdentifiers>linux-musl-x64;linux-x64</RuntimeIdentifiers>
+    <PlatformTarget>x64</PlatformTarget>
+
     <!-- AOT codegen: target Haswell (AVX2, FMA, BMI1/2, POPCNT, F16C). -->
     <IlcInstructionSet>avx2</IlcInstructionSet>
     <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
