@@ -17,8 +17,9 @@ var resourcesPath = Environment.GetEnvironmentVariable("RESOURCES_PATH")
     ?? Path.Combine(AppContext.BaseDirectory, "..", "resources");
 
 var dataLoader = new DataLoader(resourcesPath);
+var fraudDetector = new FraudDetector(dataLoader);
 builder.Services.AddSingleton(dataLoader);
-builder.Services.AddSingleton<FraudDetector>();
+builder.Services.AddSingleton(fraudDetector);
 
 var app = builder.Build();
 
