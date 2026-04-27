@@ -1,3 +1,4 @@
-requests.http
-resources
-tools
+*
+!docker-compose.yml
+!info.json
+!nginx.conf
