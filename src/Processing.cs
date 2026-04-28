@@ -1,4 +1,4 @@
-using System.Numerics;
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -7,25 +7,39 @@ using Rinha2026.Models;
 
 namespace Rinha2026.Services;
 
-public class DataLoader
+[StructLayout(LayoutKind.Sequential)]
+public struct VpNode
 {
-    public const int Scale = 127;
+    public int PivotIdx;    // -1 quando o nó é folha
+    public long Radius;
+    public int Left;
+    public int Right;
+    public int LeafStart;   // offset em LeafIndices
+    public int LeafLen;     // > 0 quando folha; 0 quando interno
+}
+
+public unsafe class DataLoader : IDisposable
+{
+    public const int Scale = 8192;
     public const int Dim = 14;
-    public const int MccBuckets = 10;
-    public const int NumBuckets = 16 * MccBuckets;
-    public const int DefaultScanBudget = 300_000;
+    public const int Stride = 16;       // 14 dims + 2 zero pad
+    public const int K = 5;
+    public const int VpNone = -1;
+    public const int MaxStackCapacity = 256;
 
     public Dictionary<string, double> MccRisk { get; }
     public NormalizationConfig Normalization { get; }
-    public sbyte[][] Dims { get; }
-    public byte[] Labels { get; }
+    public byte[] Labels { get; }       // pequeno, fica em managed heap
     public int Count { get; }
+    public int NodeCount { get; }
+    public int IndicesCount { get; }
 
-    // Bucketing: refs já vêm ordenadas por bucket no arquivo.
-    public int[] BucketStart { get; }   // [NumBuckets]
-    public int[] BucketEnd { get; }     // [NumBuckets]
-    public int[][] BucketOrder { get; } // [NumBuckets][NumBuckets] — ordem de proximidade
-    public int ScanBudget { get; }
+    // Os 3 maiores buffers ficam em memória nativa (NativeMemory.Alloc) pra não
+    // contar contra o GC heap hard limit (~75% do cgroup). Sobra heap gerenciado
+    // suficiente pra Kestrel/JSON sob carga sem cair em managed OOM.
+    public short* Vectors { get; }       // Count * Stride
+    public VpNode* Nodes { get; }        // NodeCount
+    public int* LeafIndices { get; }     // IndicesCount
 
     public DataLoader(string resourcesPath)
     {
@@ -37,96 +51,64 @@ public class DataLoader
             File.ReadAllText(Path.Combine(resourcesPath, "normalization.json")),
             AppJsonContext.Default.NormalizationConfig)!;
 
-        // Formato v4: [int32 count][14 × count sbyte SoA bucketizado][count labels][NumBuckets × int32 bucketCount]
+        // Formato v5: [int32 count][N*Stride shorts][N labels][int32 nodeCount][nodes][int32 indCount][indices]
         using var fs = File.OpenRead(Path.Combine(resourcesPath, "references.bin"));
-        using var br = new BinaryReader(fs);
-        Count = br.ReadInt32();
 
-        Dims = new sbyte[Dim][];
-        for (int j = 0; j < Dim; j++)
-        {
-            Dims[j] = GC.AllocateUninitializedArray<sbyte>(Count, pinned: true);
-            var bytes = MemoryMarshal.AsBytes(Dims[j].AsSpan());
-            int got = fs.Read(bytes);
-            if (got != Count) throw new InvalidDataException($"references.bin truncado na coluna {j}");
-        }
-        Labels = br.ReadBytes(Count);
+        Span<byte> intBuf = stackalloc byte[4];
 
-        var bucketCount = new int[NumBuckets];
-        for (int b = 0; b < NumBuckets; b++) bucketCount[b] = br.ReadInt32();
+        fs.ReadExactly(intBuf);
+        Count = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
 
-        BucketStart = new int[NumBuckets];
-        BucketEnd = new int[NumBuckets];
-        int acc = 0;
-        for (int b = 0; b < NumBuckets; b++)
-        {
-            BucketStart[b] = acc;
-            acc += bucketCount[b];
-            BucketEnd[b] = acc;
-        }
-        if (acc != Count) throw new InvalidDataException($"bucketCount soma {acc} != Count {Count}");
+        long vecBytes = (long)Count * Stride * sizeof(short);
+        Vectors = (short*)NativeMemory.AllocZeroed((nuint)vecBytes);
+        ReadExact(fs, (byte*)Vectors, vecBytes);
 
-        BucketOrder = BuildBucketOrder();
+        Labels = new byte[Count];
+        fs.ReadExactly(Labels);
 
-        var budgetStr = Environment.GetEnvironmentVariable("SCAN_BUDGET");
-        ScanBudget = (budgetStr is not null && int.TryParse(budgetStr, out var cv) && cv > 0)
-            ? cv : DefaultScanBudget;
+        fs.ReadExactly(intBuf);
+        NodeCount = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
+        long nodeBytes = (long)NodeCount * sizeof(VpNode);
+        Nodes = (VpNode*)NativeMemory.AllocZeroed((nuint)nodeBytes);
+        ReadExact(fs, (byte*)Nodes, nodeBytes);
+
+        fs.ReadExactly(intBuf);
+        IndicesCount = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
+        long indBytes = (long)IndicesCount * sizeof(int);
+        LeafIndices = (int*)NativeMemory.AllocZeroed((nuint)indBytes);
+        ReadExact(fs, (byte*)LeafIndices, indBytes);
     }
 
-    // Pra cada bucket de query, ordena os outros buckets por penalty crescente.
-    private static int[][] BuildBucketOrder()
+    private static void ReadExact(Stream s, byte* dst, long total)
     {
-        var order = new int[NumBuckets][];
-        var pairs = new (int b, int p)[NumBuckets];
-        for (int q = 0; q < NumBuckets; q++)
+        long read = 0;
+        while (read < total)
         {
-            for (int b = 0; b < NumBuckets; b++) pairs[b] = (b, Penalty(q, b));
-            Array.Sort(pairs, (x, y) =>
-            {
-                int c = x.p.CompareTo(y.p);
-                return c != 0 ? c : x.b.CompareTo(y.b);
-            });
-            var arr = new int[NumBuckets];
-            for (int i = 0; i < NumBuckets; i++) arr[i] = pairs[i].b;
-            order[q] = arr;
+            int chunk = (int)Math.Min(total - read, int.MaxValue / 2);
+            int got = s.Read(new Span<byte>(dst + read, chunk));
+            if (got == 0) throw new InvalidDataException("references.bin truncado");
+            read += got;
         }
-        return order;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int Penalty(int qkey, int bkey)
+    public void Dispose()
     {
-        int qmcc = qkey % MccBuckets;
-        int bmcc = bkey % MccBuckets;
-        int q4 = qkey / MccBuckets;
-        int b4 = bkey / MccBuckets;
-        int hamming = BitOperations.PopCount((uint)(q4 ^ b4));
-        int mccDist = Math.Abs(qmcc - bmcc);
-        return hamming * MccBuckets + mccDist;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static int MakeBucketKey(sbyte d5, sbyte d9, sbyte d10, sbyte d11, sbyte d12)
-    {
-        int hasLast = d5 >= 0 ? 1 : 0;
-        int online = d9 > 64 ? 1 : 0;
-        int cardPresent = d10 > 64 ? 1 : 0;
-        int unknown = d11 > 64 ? 1 : 0;
-        int mcc = d12 <= 0 ? 0 : Math.Min(MccBuckets - 1, d12 * MccBuckets / 128);
-        return ((((hasLast * 2 + online) * 2 + cardPresent) * 2 + unknown) * MccBuckets) + mcc;
+        if (Vectors != null) NativeMemory.Free(Vectors);
+        if (Nodes != null) NativeMemory.Free(Nodes);
+        if (LeafIndices != null) NativeMemory.Free(LeafIndices);
     }
 }
 
 public static class Vectorizer
 {
-    private static readonly sbyte[] HourLut = BuildLut(24, 23.0);
-    private static readonly sbyte[] DowLut = BuildLut(7, 6.0);
+    private static readonly short[] HourLut = BuildLut(24, 23.0);
+    private static readonly short[] DowLut = BuildLut(7, 6.0);
 
-    private static sbyte[] BuildLut(int n, double divisor)
+    private static short[] BuildLut(int n, double divisor)
     {
-        var arr = new sbyte[n];
+        var arr = new short[n];
         for (int i = 0; i < n; i++)
-            arr[i] = (sbyte)Math.Round(i / divisor * DataLoader.Scale);
+            arr[i] = (short)Math.Round(i / divisor * DataLoader.Scale);
         return arr;
     }
 
@@ -144,7 +126,7 @@ public static class Vectorizer
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Vectorize(FraudRequest req, NormalizationConfig norm,
-        Dictionary<string, double> mccRisk, Span<sbyte> output)
+        Dictionary<string, double> mccRisk, Span<short> output)
     {
         var requestedAt = ParseIsoUtc(req.Transaction.RequestedAt);
         var dow = ((int)requestedAt.DayOfWeek + 6) % 7;
@@ -164,15 +146,15 @@ public static class Vectorizer
         }
         else
         {
-            output[5] = (sbyte)-DataLoader.Scale;
-            output[6] = (sbyte)-DataLoader.Scale;
+            output[5] = (short)-DataLoader.Scale;
+            output[6] = (short)-DataLoader.Scale;
         }
 
         output[7] = Q(Clamp(req.Terminal.KmFromHome / norm.MaxKm));
         output[8] = Q(Clamp(req.Customer.TxCount24h / norm.MaxTxCount24h));
-        output[9]  = req.Terminal.IsOnline ? (sbyte)DataLoader.Scale : (sbyte)0;
-        output[10] = req.Terminal.CardPresent ? (sbyte)DataLoader.Scale : (sbyte)0;
-        output[11] = req.Customer.KnownMerchants.Contains(req.Merchant.Id) ? (sbyte)0 : (sbyte)DataLoader.Scale;
+        output[9]  = req.Terminal.IsOnline ? (short)DataLoader.Scale : (short)0;
+        output[10] = req.Terminal.CardPresent ? (short)DataLoader.Scale : (short)0;
+        output[11] = req.Customer.KnownMerchants.Contains(req.Merchant.Id) ? (short)0 : (short)DataLoader.Scale;
         output[12] = Q(mccRisk.GetValueOrDefault(req.Merchant.Mcc, 0.5));
         output[13] = Q(Clamp(req.Merchant.AvgAmount / norm.MaxMerchantAvgAmount));
     }
@@ -181,23 +163,34 @@ public static class Vectorizer
     private static double Clamp(double x) => Math.Clamp(x, 0.0, 1.0);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static sbyte Q(double v)
+    private static short Q(double v)
     {
         var q = Math.Round(v * DataLoader.Scale);
-        if (q > sbyte.MaxValue) q = sbyte.MaxValue;
-        if (q < sbyte.MinValue) q = sbyte.MinValue;
-        return (sbyte)q;
+        if (q > short.MaxValue) q = short.MaxValue;
+        if (q < short.MinValue) q = short.MinValue;
+        return (short)q;
     }
 }
 
-public class FraudDetector
+public unsafe class FraudDetector
 {
     private readonly DataLoader _data;
+    private readonly short* _vectors;
+    private readonly VpNode* _nodes;
+    private readonly int* _leafIndices;
+    private readonly byte[] _labels;
+    private readonly int _nodeCount;
+
     public static readonly byte[][] PrecomputedResponses = BuildResponses();
 
     public FraudDetector(DataLoader data)
     {
         _data = data;
+        _vectors = data.Vectors;
+        _nodes = data.Nodes;
+        _leafIndices = data.LeafIndices;
+        _labels = data.Labels;
+        _nodeCount = data.NodeCount;
     }
 
     private static byte[][] BuildResponses()
@@ -214,189 +207,114 @@ public class FraudDetector
 
     public int FraudCount(FraudRequest req)
     {
-        Span<sbyte> query = stackalloc sbyte[DataLoader.Dim];
+        Span<short> query = stackalloc short[DataLoader.Stride];
         Vectorizer.Vectorize(req, _data.Normalization, _data.MccRisk, query);
-        int qkey = DataLoader.MakeBucketKey(query[5], query[9], query[10], query[11], query[12]);
-        return CountFraudNeighborsBucketed(query, qkey);
+        return SearchKnn(query);
     }
 
-    private int CountFraudNeighborsBucketed(ReadOnlySpan<sbyte> query, int qkey)
+    private int SearchKnn(ReadOnlySpan<short> query)
     {
-        var dims = _data.Dims;
-        var labels = _data.Labels;
-        var order = _data.BucketOrder[qkey];
-        var bStart = _data.BucketStart;
-        var bEnd = _data.BucketEnd;
-        int budget = _data.ScanBudget;
+        if (_nodeCount == 0) return 0;
 
-        // Broadcasts da query.
-        var q0  = Vector256.Create((short)query[0]);
-        var q1  = Vector256.Create((short)query[1]);
-        var q2  = Vector256.Create((short)query[2]);
-        var q3  = Vector256.Create((short)query[3]);
-        var q4  = Vector256.Create((short)query[4]);
-        var q5  = Vector256.Create((short)query[5]);
-        var q6  = Vector256.Create((short)query[6]);
-        var q7  = Vector256.Create((short)query[7]);
-        var q8  = Vector256.Create((short)query[8]);
-        var q9  = Vector256.Create((short)query[9]);
-        var q10 = Vector256.Create((short)query[10]);
-        var q11 = Vector256.Create((short)query[11]);
-        var q12 = Vector256.Create((short)query[12]);
-        var q13 = Vector256.Create((short)query[13]);
+        int k = DataLoader.K;
+        var labels = _labels;
+        VpNode* nodes = _nodes;
+        int* leafIndices = _leafIndices;
+        short* vectors = _vectors;
 
-        ref var d0  = ref MemoryMarshal.GetArrayDataReference(dims[0]);
-        ref var d1  = ref MemoryMarshal.GetArrayDataReference(dims[1]);
-        ref var d2  = ref MemoryMarshal.GetArrayDataReference(dims[2]);
-        ref var d3  = ref MemoryMarshal.GetArrayDataReference(dims[3]);
-        ref var d4  = ref MemoryMarshal.GetArrayDataReference(dims[4]);
-        ref var d5  = ref MemoryMarshal.GetArrayDataReference(dims[5]);
-        ref var d6  = ref MemoryMarshal.GetArrayDataReference(dims[6]);
-        ref var d7  = ref MemoryMarshal.GetArrayDataReference(dims[7]);
-        ref var d8  = ref MemoryMarshal.GetArrayDataReference(dims[8]);
-        ref var d9  = ref MemoryMarshal.GetArrayDataReference(dims[9]);
-        ref var d10 = ref MemoryMarshal.GetArrayDataReference(dims[10]);
-        ref var d11 = ref MemoryMarshal.GetArrayDataReference(dims[11]);
-        ref var d12 = ref MemoryMarshal.GetArrayDataReference(dims[12]);
-        ref var d13 = ref MemoryMarshal.GetArrayDataReference(dims[13]);
-
-        Span<int> bestD = stackalloc int[5] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
+        Span<long> bestD = stackalloc long[5] { long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue };
         Span<int> bestId = stackalloc int[5];
-        int worst = 0;
-        int worstD = int.MaxValue;
+        int found = 0;
 
-        Span<int> dists = stackalloc int[32];
-        ref var distsRef = ref MemoryMarshal.GetReference(dists);
+        Span<int> stack = stackalloc int[DataLoader.MaxStackCapacity];
+        int stackLen = 1;
+        stack[0] = 0;
 
-        int scanned = 0;
-        for (int oi = 0; oi < DataLoader.NumBuckets; oi++)
+        var qVec = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(query));
+
+        while (stackLen > 0)
         {
-            int b = order[oi];
-            int start = bStart[b];
-            int end = bEnd[b];
-            int sz = end - start;
-            if (sz <= 0) continue;
+            int nodeIdx = stack[--stackLen];
+            VpNode* node = nodes + nodeIdx;
 
-            int simdEnd = start + (sz & ~31); // múltiplo de 32 dentro do bucket
-            int i = start;
-            for (; i < simdEnd; i += 32)
+            if (node->LeafLen > 0)
             {
-                if (scanned >= budget) goto done;
-                scanned += 32;
-
-                nuint off = (nuint)i;
-                var aA = Vector256<int>.Zero;
-                var aB = Vector256<int>.Zero;
-                var aC = Vector256<int>.Zero;
-                var aD = Vector256<int>.Zero;
-                var wVec = Vector256.Create(worstD);
-
-                Acc(q5,  ref d5,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q6,  ref d6,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q2,  ref d2,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q0,  ref d0,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q7,  ref d7,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q8,  ref d8,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q11, ref d11, off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q12, ref d12, off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q9,  ref d9,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q10, ref d10, off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q1,  ref d1,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q13, ref d13, off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q3,  ref d3,  off, ref aA, ref aB, ref aC, ref aD);
-                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-                Acc(q4,  ref d4,  off, ref aA, ref aB, ref aC, ref aD);
-
-                aA.StoreUnsafe(ref distsRef);
-                aB.StoreUnsafe(ref distsRef, 8);
-                aC.StoreUnsafe(ref distsRef, 16);
-                aD.StoreUnsafe(ref distsRef, 24);
-
-                for (int k = 0; k < 32; k++)
+                int leafEnd = node->LeafStart + node->LeafLen;
+                for (int i = node->LeafStart; i < leafEnd; i++)
                 {
-                    int d = dists[k];
-                    if (d < worstD)
-                    {
-                        bestD[worst] = d;
-                        bestId[worst] = i + k;
-                        worst = 0; worstD = bestD[0];
-                        for (int j = 1; j < 5; j++)
-                            if (bestD[j] > worstD) { worst = j; worstD = bestD[j]; }
-                    }
+                    int refIdx = leafIndices[i];
+                    long dist = DistByQuery(qVec, vectors, refIdx);
+                    InsertTopK(bestD, bestId, ref found, refIdx, dist, k);
+                }
+                continue;
+            }
+
+            int pivotIdx = node->PivotIdx;
+            long pivotDist = DistByQuery(qVec, vectors, pivotIdx);
+            InsertTopK(bestD, bestId, ref found, pivotIdx, pivotDist, k);
+
+            int near, far;
+            if (pivotDist <= node->Radius) { near = node->Left;  far = node->Right; }
+            else                            { near = node->Right; far = node->Left;  }
+
+            // Poda VP-tree: pula a sub-árvore far se a distância garantida pelo
+            // anel em volta do pivot já é > worst do top-k atual.
+            bool canVisitFar = false;
+            if (far != DataLoader.VpNone)
+            {
+                if (found < k) canVisitFar = true;
+                else
+                {
+                    long worstDist = bestD[k - 1];
+                    double pivotNorm = Math.Sqrt(pivotDist);
+                    double radiusNorm = Math.Sqrt(node->Radius);
+                    double worstNorm = Math.Sqrt(worstDist);
+                    canVisitFar = Math.Abs(pivotNorm - radiusNorm) <= worstNorm;
                 }
             }
 
-            // Cauda escalar do bucket.
-            for (; i < end; i++)
-            {
-                if (scanned >= budget) goto done;
-                scanned++;
-                int d = 0;
-                for (int j = 0; j < DataLoader.Dim; j++)
-                {
-                    int diff = query[j] - dims[j][i];
-                    d += diff * diff;
-                }
-                if (d < worstD)
-                {
-                    bestD[worst] = d;
-                    bestId[worst] = i;
-                    worst = 0; worstD = bestD[0];
-                    for (int j = 1; j < 5; j++)
-                        if (bestD[j] > worstD) { worst = j; worstD = bestD[j]; }
-                }
-            }
+            // Empilha far primeiro pra near sair antes (LIFO).
+            if (canVisitFar) stack[stackLen++] = far;
+            if (near != DataLoader.VpNone) stack[stackLen++] = near;
         }
-        done:;
 
         int fraudCount = 0;
-        for (int k = 0; k < 5; k++)
-            if (bestD[k] != int.MaxValue) fraudCount += labels[bestId[k]];
+        for (int i = 0; i < found; i++)
+            fraudCount += labels[bestId[i]];
         return fraudCount;
     }
 
+    // L2² entre query (Vector256<short>) e a ref no índice refIdx.
+    // Acumula em long pra evitar overflow na soma das 16 lanes.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Acc(
-        Vector256<short> q, ref sbyte dimBase, nuint off,
-        ref Vector256<int> a, ref Vector256<int> b,
-        ref Vector256<int> c, ref Vector256<int> d)
+    private static long DistByQuery(Vector256<short> qVec, short* vectors, int refIdx)
     {
-        var packed = Vector256.LoadUnsafe(ref dimBase, off);
-        var (vLo, vHi) = Vector256.Widen(packed);
-
-        var diffLo = q - vLo;
-        var diffHi = q - vHi;
-
-        var (loLo, loHi) = Vector256.Widen(diffLo);
-        var (hiLo, hiHi) = Vector256.Widen(diffHi);
-
-        a += loLo * loLo;
-        b += loHi * loHi;
-        c += hiLo * hiLo;
-        d += hiHi * hiHi;
+        var v = Vector256.Load(vectors + refIdx * DataLoader.Stride);
+        var diff = qVec - v;                          // 16 shorts (Scale=8192 ≤ 16384, no overflow)
+        var (dLo, dHi) = Vector256.Widen(diff);       // 8 ints + 8 ints
+        var sqLo = dLo * dLo;                          // 8 ints (≤ 268M cada)
+        var sqHi = dHi * dHi;
+        var (sqLoLo, sqLoHi) = Vector256.Widen(sqLo); // 4 longs + 4 longs
+        var (sqHiLo, sqHiHi) = Vector256.Widen(sqHi);
+        var sum = (sqLoLo + sqLoHi) + (sqHiLo + sqHiHi);
+        return Vector256.Sum(sum);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool AllExceed(
-        Vector256<int> a, Vector256<int> b, Vector256<int> c, Vector256<int> d,
-        Vector256<int> w)
+    private static void InsertTopK(Span<long> bestD, Span<int> bestId, ref int found, int idx, long dist, int k)
     {
-        uint ma = Vector256.LessThan(a, w).ExtractMostSignificantBits();
-        uint mb = Vector256.LessThan(b, w).ExtractMostSignificantBits();
-        uint mc = Vector256.LessThan(c, w).ExtractMostSignificantBits();
-        uint md = Vector256.LessThan(d, w).ExtractMostSignificantBits();
-        return (ma | mb | mc | md) == 0;
+        int insertAt = 0;
+        while (insertAt < found && bestD[insertAt] < dist) insertAt++;
+        if (insertAt >= k) return;
+
+        int upperBound = Math.Min(found, k - 1);
+        for (int i = upperBound - 1; i >= insertAt; i--)
+        {
+            bestD[i + 1] = bestD[i];
+            bestId[i + 1] = bestId[i];
+        }
+        bestD[insertAt] = dist;
+        bestId[insertAt] = idx;
+        if (found < k) found++;
     }
 }

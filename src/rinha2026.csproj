@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!-- Pin codegen target to x86_64 / linux-musl-x64. AVX2 below already implies
          x86_64, but these declarations make the architecture explicit and prevent
