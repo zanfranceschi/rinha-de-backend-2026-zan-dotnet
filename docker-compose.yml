@@ -1,5 +1,5 @@
 x-api: &api
-  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202604280338
+  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202604280425
   volumes:
     - sock:/run/sock
   deploy:
@@ -13,14 +13,14 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
-      SCAN_BUDGET: 1000
+      SCAN_BUDGET: 200000
     cpuset: "0,1"
 
   api2:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
-      SCAN_BUDGET: 1000
+      SCAN_BUDGET: 200000
     cpuset: "2,3"
 
   nginx:
