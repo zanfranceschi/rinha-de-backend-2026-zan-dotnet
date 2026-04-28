@@ -281,6 +281,9 @@ public class FraudDetector
             int i = start;
             for (; i < simdEnd; i += 32)
             {
+                if (scanned >= budget) goto done;
+                scanned += 32;
+
                 nuint off = (nuint)i;
                 var aA = Vector256<int>.Zero;
                 var aB = Vector256<int>.Zero;
@@ -338,6 +341,8 @@ public class FraudDetector
             // Cauda escalar do bucket.
             for (; i < end; i++)
             {
+                if (scanned >= budget) goto done;
+                scanned++;
                 int d = 0;
                 for (int j = 0; j < DataLoader.Dim; j++)
                 {
@@ -353,10 +358,8 @@ public class FraudDetector
                         if (bestD[j] > worstD) { worst = j; worstD = bestD[j]; }
                 }
             }
-
-            scanned += sz;
-            if (scanned >= budget) break;
         }
+        done:;
 
         int fraudCount = 0;
         for (int k = 0; k < 5; k++)
