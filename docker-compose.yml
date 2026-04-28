@@ -13,13 +13,13 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
-      SCAN_BUDGET: 300000
+      SCAN_BUDGET: 50000
 
   api2:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
-      SCAN_BUDGET: 300000
+      SCAN_BUDGET: 50000
 
   nginx:
     image: nginx:alpine
