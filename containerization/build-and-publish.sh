@@ -14,3 +14,5 @@ docker build \
 docker push --all-tags $IMAGE
 
 echo "Published $IMAGE:$TAG"
+
+echo $TAG

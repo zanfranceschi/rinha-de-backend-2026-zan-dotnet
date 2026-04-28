@@ -215,23 +215,38 @@ public class FraudDetector
             nuint off = (nuint)i;
             var acc0 = Vector256<int>.Zero;
             var acc1 = Vector256<int>.Zero;
+            var wVec = Vector256.Create(worstD);
 
-            // 14 dims; widen short->int produz (lower 8 lanes, upper 8 lanes).
-            // diff² acumulado em dois acc's int.
-            Accumulate(q0,  ref d0,  off, ref acc0, ref acc1);
-            Accumulate(q1,  ref d1,  off, ref acc0, ref acc1);
-            Accumulate(q2,  ref d2,  off, ref acc0, ref acc1);
-            Accumulate(q3,  ref d3,  off, ref acc0, ref acc1);
-            Accumulate(q4,  ref d4,  off, ref acc0, ref acc1);
+            // Ordem das dims: mais discriminantes primeiro, pra apertar o worstD rápido.
+            // (mesma heurística do rinha-2026: 5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4)
+            // Após cada dim, se TODAS as 16 lanes já estouraram worstD, pula o resto.
             Accumulate(q5,  ref d5,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
             Accumulate(q6,  ref d6,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q2,  ref d2,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q0,  ref d0,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
             Accumulate(q7,  ref d7,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
             Accumulate(q8,  ref d8,  off, ref acc0, ref acc1);
-            Accumulate(q9,  ref d9,  off, ref acc0, ref acc1);
-            Accumulate(q10, ref d10, off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
             Accumulate(q11, ref d11, off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
             Accumulate(q12, ref d12, off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q9,  ref d9,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q10, ref d10, off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q1,  ref d1,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
             Accumulate(q13, ref d13, off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q3,  ref d3,  off, ref acc0, ref acc1);
+            if (AllExceed(acc0, acc1, wVec)) continue;
+            Accumulate(q4,  ref d4,  off, ref acc0, ref acc1);
 
             acc0.StoreUnsafe(ref distsRef);
             acc1.StoreUnsafe(ref distsRef, 8);
@@ -285,5 +300,15 @@ public class FraudDetector
         var (lo, hi) = Vector256.Widen(diff);
         acc0 += lo * lo;
         acc1 += hi * hi;
+    }
+
+    // True quando TODAS as 16 lanes (8 em acc0 + 8 em acc1) já têm acc >= worstD.
+    // Se for true, nenhuma das 16 refs deste grupo pode entrar no top-5.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool AllExceed(Vector256<int> acc0, Vector256<int> acc1, Vector256<int> wVec)
+    {
+        uint m0 = Vector256.LessThan(acc0, wVec).ExtractMostSignificantBits();
+        uint m1 = Vector256.LessThan(acc1, wVec).ExtractMostSignificantBits();
+        return (m0 | m1) == 0;
     }
 }
