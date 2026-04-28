@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -8,14 +9,23 @@ namespace Rinha2026.Services;
 
 public class DataLoader
 {
-    public const int Scale = 127;     // sbyte range
+    public const int Scale = 127;
     public const int Dim = 14;
+    public const int MccBuckets = 10;
+    public const int NumBuckets = 16 * MccBuckets;
+    public const int DefaultScanBudget = 300_000;
 
     public Dictionary<string, double> MccRisk { get; }
     public NormalizationConfig Normalization { get; }
-    public sbyte[][] Dims { get; }   // [Dim][Count] — SoA, sbyte
+    public sbyte[][] Dims { get; }
     public byte[] Labels { get; }
     public int Count { get; }
+
+    // Bucketing: refs já vêm ordenadas por bucket no arquivo.
+    public int[] BucketStart { get; }   // [NumBuckets]
+    public int[] BucketEnd { get; }     // [NumBuckets]
+    public int[][] BucketOrder { get; } // [NumBuckets][NumBuckets] — ordem de proximidade
+    public int ScanBudget { get; }
 
     public DataLoader(string resourcesPath)
     {
@@ -27,10 +37,7 @@ public class DataLoader
             File.ReadAllText(Path.Combine(resourcesPath, "normalization.json")),
             AppJsonContext.Default.NormalizationConfig)!;
 
-        // Formato v3 (SoA, sbyte):
-        //   [int32 count]
-        //   [14 × count sbytes — coluna por coluna]
-        //   [count bytes labels]
+        // Formato v4: [int32 count][14 × count sbyte SoA bucketizado][count labels][NumBuckets × int32 bucketCount]
         using var fs = File.OpenRead(Path.Combine(resourcesPath, "references.bin"));
         using var br = new BinaryReader(fs);
         Count = br.ReadInt32();
@@ -44,6 +51,69 @@ public class DataLoader
             if (got != Count) throw new InvalidDataException($"references.bin truncado na coluna {j}");
         }
         Labels = br.ReadBytes(Count);
+
+        var bucketCount = new int[NumBuckets];
+        for (int b = 0; b < NumBuckets; b++) bucketCount[b] = br.ReadInt32();
+
+        BucketStart = new int[NumBuckets];
+        BucketEnd = new int[NumBuckets];
+        int acc = 0;
+        for (int b = 0; b < NumBuckets; b++)
+        {
+            BucketStart[b] = acc;
+            acc += bucketCount[b];
+            BucketEnd[b] = acc;
+        }
+        if (acc != Count) throw new InvalidDataException($"bucketCount soma {acc} != Count {Count}");
+
+        BucketOrder = BuildBucketOrder();
+
+        var budgetStr = Environment.GetEnvironmentVariable("SCAN_BUDGET");
+        ScanBudget = (budgetStr is not null && int.TryParse(budgetStr, out var cv) && cv > 0)
+            ? cv : DefaultScanBudget;
+    }
+
+    // Pra cada bucket de query, ordena os outros buckets por penalty crescente.
+    private static int[][] BuildBucketOrder()
+    {
+        var order = new int[NumBuckets][];
+        var pairs = new (int b, int p)[NumBuckets];
+        for (int q = 0; q < NumBuckets; q++)
+        {
+            for (int b = 0; b < NumBuckets; b++) pairs[b] = (b, Penalty(q, b));
+            Array.Sort(pairs, (x, y) =>
+            {
+                int c = x.p.CompareTo(y.p);
+                return c != 0 ? c : x.b.CompareTo(y.b);
+            });
+            var arr = new int[NumBuckets];
+            for (int i = 0; i < NumBuckets; i++) arr[i] = pairs[i].b;
+            order[q] = arr;
+        }
+        return order;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int Penalty(int qkey, int bkey)
+    {
+        int qmcc = qkey % MccBuckets;
+        int bmcc = bkey % MccBuckets;
+        int q4 = qkey / MccBuckets;
+        int b4 = bkey / MccBuckets;
+        int hamming = BitOperations.PopCount((uint)(q4 ^ b4));
+        int mccDist = Math.Abs(qmcc - bmcc);
+        return hamming * MccBuckets + mccDist;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int MakeBucketKey(sbyte d5, sbyte d9, sbyte d10, sbyte d11, sbyte d12)
+    {
+        int hasLast = d5 >= 0 ? 1 : 0;
+        int online = d9 > 64 ? 1 : 0;
+        int cardPresent = d10 > 64 ? 1 : 0;
+        int unknown = d11 > 64 ? 1 : 0;
+        int mcc = d12 <= 0 ? 0 : Math.Min(MccBuckets - 1, d12 * MccBuckets / 128);
+        return ((((hasLast * 2 + online) * 2 + cardPresent) * 2 + unknown) * MccBuckets) + mcc;
     }
 }
 
@@ -146,17 +216,20 @@ public class FraudDetector
     {
         Span<sbyte> query = stackalloc sbyte[DataLoader.Dim];
         Vectorizer.Vectorize(req, _data.Normalization, _data.MccRisk, query);
-        return CountFraudNeighborsLinear(query);
+        int qkey = DataLoader.MakeBucketKey(query[5], query[9], query[10], query[11], query[12]);
+        return CountFraudNeighborsBucketed(query, qkey);
     }
 
-    private int CountFraudNeighborsLinear(ReadOnlySpan<sbyte> query)
+    private int CountFraudNeighborsBucketed(ReadOnlySpan<sbyte> query, int qkey)
     {
         var dims = _data.Dims;
-        int count = _data.Count;
         var labels = _data.Labels;
+        var order = _data.BucketOrder[qkey];
+        var bStart = _data.BucketStart;
+        var bEnd = _data.BucketEnd;
+        int budget = _data.ScanBudget;
 
-        // Broadcast da query como Vector256<short> (a aritmética é feita em short
-        // pra evitar overflow de sbyte na subtração).
+        // Broadcasts da query.
         var q0  = Vector256.Create((short)query[0]);
         var q1  = Vector256.Create((short)query[1]);
         var q2  = Vector256.Create((short)query[2]);
@@ -187,97 +260,102 @@ public class FraudDetector
         ref var d12 = ref MemoryMarshal.GetArrayDataReference(dims[12]);
         ref var d13 = ref MemoryMarshal.GetArrayDataReference(dims[13]);
 
-        // Top-5 (sem alocações).
         Span<int> bestD = stackalloc int[5] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
         Span<int> bestId = stackalloc int[5];
         int worst = 0;
         int worstD = int.MaxValue;
 
-        // Buffer pra extrair as 32 distâncias por iteração.
         Span<int> dists = stackalloc int[32];
         ref var distsRef = ref MemoryMarshal.GetReference(dists);
 
-        int simdEnd = count - (count & 31); // múltiplo de 32 (refs por iter)
-        int i = 0;
-        for (; i < simdEnd; i += 32)
+        int scanned = 0;
+        for (int oi = 0; oi < DataLoader.NumBuckets; oi++)
         {
-            nuint off = (nuint)i;
-            var aA = Vector256<int>.Zero;
-            var aB = Vector256<int>.Zero;
-            var aC = Vector256<int>.Zero;
-            var aD = Vector256<int>.Zero;
-            var wVec = Vector256.Create(worstD);
+            int b = order[oi];
+            int start = bStart[b];
+            int end = bEnd[b];
+            int sz = end - start;
+            if (sz <= 0) continue;
 
-            // Ordem das dims pra apertar worstD rápido (igual passo 3).
-            Acc(q5,  ref d5,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q6,  ref d6,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q2,  ref d2,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q0,  ref d0,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q7,  ref d7,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q8,  ref d8,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q11, ref d11, off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q12, ref d12, off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q9,  ref d9,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q10, ref d10, off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q1,  ref d1,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q13, ref d13, off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q3,  ref d3,  off, ref aA, ref aB, ref aC, ref aD);
-            if (AllExceed(aA, aB, aC, aD, wVec)) continue;
-            Acc(q4,  ref d4,  off, ref aA, ref aB, ref aC, ref aD);
-
-            // Mapeamento ref → posição em `dists`:
-            //   aA → refs i+0 .. i+7    (lower-lower)
-            //   aB → refs i+8 .. i+15   (lower-upper)
-            //   aC → refs i+16 .. i+23  (upper-lower)
-            //   aD → refs i+24 .. i+31  (upper-upper)
-            aA.StoreUnsafe(ref distsRef);
-            aB.StoreUnsafe(ref distsRef, 8);
-            aC.StoreUnsafe(ref distsRef, 16);
-            aD.StoreUnsafe(ref distsRef, 24);
-
-            for (int k = 0; k < 32; k++)
+            int simdEnd = start + (sz & ~31); // múltiplo de 32 dentro do bucket
+            int i = start;
+            for (; i < simdEnd; i += 32)
             {
-                int d = dists[k];
+                nuint off = (nuint)i;
+                var aA = Vector256<int>.Zero;
+                var aB = Vector256<int>.Zero;
+                var aC = Vector256<int>.Zero;
+                var aD = Vector256<int>.Zero;
+                var wVec = Vector256.Create(worstD);
+
+                Acc(q5,  ref d5,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q6,  ref d6,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q2,  ref d2,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q0,  ref d0,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q7,  ref d7,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q8,  ref d8,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q11, ref d11, off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q12, ref d12, off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q9,  ref d9,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q10, ref d10, off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q1,  ref d1,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q13, ref d13, off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q3,  ref d3,  off, ref aA, ref aB, ref aC, ref aD);
+                if (AllExceed(aA, aB, aC, aD, wVec)) continue;
+                Acc(q4,  ref d4,  off, ref aA, ref aB, ref aC, ref aD);
+
+                aA.StoreUnsafe(ref distsRef);
+                aB.StoreUnsafe(ref distsRef, 8);
+                aC.StoreUnsafe(ref distsRef, 16);
+                aD.StoreUnsafe(ref distsRef, 24);
+
+                for (int k = 0; k < 32; k++)
+                {
+                    int d = dists[k];
+                    if (d < worstD)
+                    {
+                        bestD[worst] = d;
+                        bestId[worst] = i + k;
+                        worst = 0; worstD = bestD[0];
+                        for (int j = 1; j < 5; j++)
+                            if (bestD[j] > worstD) { worst = j; worstD = bestD[j]; }
+                    }
+                }
+            }
+
+            // Cauda escalar do bucket.
+            for (; i < end; i++)
+            {
+                int d = 0;
+                for (int j = 0; j < DataLoader.Dim; j++)
+                {
+                    int diff = query[j] - dims[j][i];
+                    d += diff * diff;
+                }
                 if (d < worstD)
                 {
                     bestD[worst] = d;
-                    bestId[worst] = i + k;
+                    bestId[worst] = i;
                     worst = 0; worstD = bestD[0];
                     for (int j = 1; j < 5; j++)
                         if (bestD[j] > worstD) { worst = j; worstD = bestD[j]; }
                 }
             }
-        }
 
-        // Cauda escalar (resto que não fecha 32).
-        for (; i < count; i++)
-        {
-            int d = 0;
-            for (int j = 0; j < DataLoader.Dim; j++)
-            {
-                int diff = query[j] - dims[j][i];
-                d += diff * diff;
-            }
-            if (d < worstD)
-            {
-                bestD[worst] = d;
-                bestId[worst] = i;
-                worst = 0; worstD = bestD[0];
-                for (int j = 1; j < 5; j++)
-                    if (bestD[j] > worstD) { worst = j; worstD = bestD[j]; }
-            }
+            scanned += sz;
+            if (scanned >= budget) break;
         }
 
         int fraudCount = 0;
@@ -286,21 +364,20 @@ public class FraudDetector
         return fraudCount;
     }
 
-    // Acumula a contribuição de uma dim em 4 acc's de int (8 lanes cada → 32 refs total).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Acc(
         Vector256<short> q, ref sbyte dimBase, nuint off,
         ref Vector256<int> a, ref Vector256<int> b,
         ref Vector256<int> c, ref Vector256<int> d)
     {
-        var packed = Vector256.LoadUnsafe(ref dimBase, off);   // 32 sbytes
-        var (vLo, vHi) = Vector256.Widen(packed);              // 16 shorts × 2
+        var packed = Vector256.LoadUnsafe(ref dimBase, off);
+        var (vLo, vHi) = Vector256.Widen(packed);
 
-        var diffLo = q - vLo;                                  // 16 shorts (refs 0..15)
-        var diffHi = q - vHi;                                  // 16 shorts (refs 16..31)
+        var diffLo = q - vLo;
+        var diffHi = q - vHi;
 
-        var (loLo, loHi) = Vector256.Widen(diffLo);            // 8 ints × 2 (refs 0..7, 8..15)
-        var (hiLo, hiHi) = Vector256.Widen(diffHi);            // 8 ints × 2 (refs 16..23, 24..31)
+        var (loLo, loHi) = Vector256.Widen(diffLo);
+        var (hiLo, hiHi) = Vector256.Widen(diffHi);
 
         a += loLo * loLo;
         b += loHi * loHi;
@@ -308,7 +385,6 @@ public class FraudDetector
         d += hiHi * hiHi;
     }
 
-    // True quando TODAS as 32 lanes têm acc >= worstD (nenhuma pode entrar no top-5).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool AllExceed(
         Vector256<int> a, Vector256<int> b, Vector256<int> c, Vector256<int> d,

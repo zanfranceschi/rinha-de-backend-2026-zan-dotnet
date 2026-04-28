@@ -43,12 +43,15 @@ else
     legitCentroids = legit.ToArray();
 }
 
-// Write binary format v3 (quantized i8, scale 127, SoA on disk):
+// Write binary format v4 (quantized i8 SoA bucketizado):
 // [int32 count]
-// [14 × count sbytes — dim 0 contiguous, then dim 1, ..., dim 13]
-// [count bytes: label (1=fraud, 0=legit)]
+// [14 × count sbytes — SoA, refs ordenadas por bucket key]
+// [count bytes labels — mesma ordem]
+// [160 × int32 bucketCount]
 const int Scale = 127;
 const int Dim = 14;
+const int MccBuckets = 10;
+const int NumBuckets = 16 * MccBuckets;
 
 sbyte Quantize(double v)
 {
@@ -58,10 +61,20 @@ sbyte Quantize(double v)
     return (sbyte)q;
 }
 
+int MakeBucketKey(sbyte d5, sbyte d9, sbyte d10, sbyte d11, sbyte d12)
+{
+    int hasLast = d5 >= 0 ? 1 : 0;
+    int online = d9 > 64 ? 1 : 0;
+    int cardPresent = d10 > 64 ? 1 : 0;
+    int unknown = d11 > 64 ? 1 : 0;
+    int mcc = d12 <= 0 ? 0 : Math.Min(MccBuckets - 1, d12 * MccBuckets / 128);
+    return ((((hasLast * 2 + online) * 2 + cardPresent) * 2 + unknown) * MccBuckets) + mcc;
+}
+
 var outputPath = Path.Combine(resourcesPath, "references.bin");
 var total = fraudCentroids.Length + legitCentroids.Length;
 
-// Materializa quantizado em SoA pra fazer write em blocos contíguos.
+// Materializa quantizado em SoA na ordem original.
 var dims = new sbyte[Dim][];
 for (int d = 0; d < Dim; d++) dims[d] = new sbyte[total];
 var labels = new byte[total];
@@ -80,6 +93,40 @@ foreach (var v in legitCentroids)
     idx++;
 }
 
+// Calcula bucket key por ref e conta por bucket.
+var keys = new int[total];
+var bucketCount = new int[NumBuckets];
+for (int i = 0; i < total; i++)
+{
+    keys[i] = MakeBucketKey(dims[5][i], dims[9][i], dims[10][i], dims[11][i], dims[12][i]);
+    bucketCount[keys[i]]++;
+}
+
+// Permutação por counting sort.
+var bucketStart = new int[NumBuckets];
+{
+    int acc = 0;
+    for (int b = 0; b < NumBuckets; b++) { bucketStart[b] = acc; acc += bucketCount[b]; }
+}
+var perm = new int[total];
+{
+    var writePos = (int[])bucketStart.Clone();
+    for (int i = 0; i < total; i++)
+        perm[writePos[keys[i]]++] = i;
+}
+
+// Aplica permutação (uma dim por vez pra reduzir pico de memória).
+for (int d = 0; d < Dim; d++)
+{
+    var src = dims[d];
+    var dst = new sbyte[total];
+    for (int i = 0; i < total; i++) dst[i] = src[perm[i]];
+    dims[d] = dst;
+}
+var newLabels = new byte[total];
+for (int i = 0; i < total; i++) newLabels[i] = labels[perm[i]];
+labels = newLabels;
+
 using (var fs = File.Create(outputPath))
 using (var bw = new BinaryWriter(fs))
 {
@@ -90,9 +137,18 @@ using (var bw = new BinaryWriter(fs))
         fs.Write(bytes);
     }
     fs.Write(labels);
+    for (int b = 0; b < NumBuckets; b++) bw.Write(bucketCount[b]);
+}
+
+// Diagnóstico: distribuição de buckets.
+int nonEmpty = 0, maxB = 0, minB = int.MaxValue;
+for (int b = 0; b < NumBuckets; b++)
+{
+    if (bucketCount[b] > 0) { nonEmpty++; if (bucketCount[b] > maxB) maxB = bucketCount[b]; if (bucketCount[b] < minB) minB = bucketCount[b]; }
 }
 var fileSize = new FileInfo(outputPath).Length;
 Console.WriteLine($"Written {total} references to {outputPath} ({fileSize} bytes, ~{fileSize / 1024.0 / 1024.0:F1} MB)");
+Console.WriteLine($"Buckets: {nonEmpty}/{NumBuckets} usados, min={minB} max={maxB} avg={total / nonEmpty}");
 
 static double[][] KMeans(List<double[]> vectors, int k, int maxIterations)
 {
