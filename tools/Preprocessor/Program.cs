@@ -43,44 +43,56 @@ else
     legitCentroids = legit.ToArray();
 }
 
-// Write binary format v2 (quantized i16, scale 8192):
+// Write binary format v3 (quantized i8, scale 127, SoA on disk):
 // [int32 count]
-// [count * 16 shorts: 14 quantized dims + 2 zero pads each]
+// [14 × count sbytes — dim 0 contiguous, then dim 1, ..., dim 13]
 // [count bytes: label (1=fraud, 0=legit)]
-const int Scale = 8192;
-const int Stride = 16; // 14 dims + 2 pad
+const int Scale = 127;
+const int Dim = 14;
 
-short Quantize(double v)
+sbyte Quantize(double v)
 {
     var q = Math.Round(v * Scale);
-    if (q > short.MaxValue) q = short.MaxValue;
-    if (q < short.MinValue) q = short.MinValue;
-    return (short)q;
+    if (q > sbyte.MaxValue) q = sbyte.MaxValue;
+    if (q < sbyte.MinValue) q = sbyte.MinValue;
+    return (sbyte)q;
 }
 
 var outputPath = Path.Combine(resourcesPath, "references.bin");
 var total = fraudCentroids.Length + legitCentroids.Length;
-using (var bw = new BinaryWriter(File.Create(outputPath)))
+
+// Materializa quantizado em SoA pra fazer write em blocos contíguos.
+var dims = new sbyte[Dim][];
+for (int d = 0; d < Dim; d++) dims[d] = new sbyte[total];
+var labels = new byte[total];
+
+int idx = 0;
+foreach (var v in fraudCentroids)
+{
+    for (int d = 0; d < Dim; d++) dims[d][idx] = Quantize(v[d]);
+    labels[idx] = 1;
+    idx++;
+}
+foreach (var v in legitCentroids)
+{
+    for (int d = 0; d < Dim; d++) dims[d][idx] = Quantize(v[d]);
+    labels[idx] = 0;
+    idx++;
+}
+
+using (var fs = File.Create(outputPath))
+using (var bw = new BinaryWriter(fs))
 {
     bw.Write(total);
-
-    void WriteVecs(double[][] vecs)
+    for (int d = 0; d < Dim; d++)
     {
-        foreach (var c in vecs)
-        {
-            for (int i = 0; i < 14; i++) bw.Write(Quantize(c[i]));
-            bw.Write((short)0);
-            bw.Write((short)0);
-        }
+        var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(dims[d].AsSpan());
+        fs.Write(bytes);
     }
-    WriteVecs(fraudCentroids);
-    WriteVecs(legitCentroids);
-
-    foreach (var _ in fraudCentroids) bw.Write((byte)1);
-    foreach (var _ in legitCentroids) bw.Write((byte)0);
+    fs.Write(labels);
 }
 var fileSize = new FileInfo(outputPath).Length;
-Console.WriteLine($"Written {fraudCentroids.Length + legitCentroids.Length} references to {outputPath} ({fileSize} bytes)");
+Console.WriteLine($"Written {total} references to {outputPath} ({fileSize} bytes, ~{fileSize / 1024.0 / 1024.0:F1} MB)");
 
 static double[][] KMeans(List<double[]> vectors, int k, int maxIterations)
 {
