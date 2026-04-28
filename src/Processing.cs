@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Text.Json;
 using Rinha2026.Models;
 
@@ -20,7 +21,7 @@ public struct VpNode
 
 public unsafe class DataLoader : IDisposable
 {
-    public const int Scale = 8192;
+    public const int Scale = 32_767;
     public const int Dim = 14;
     public const int Stride = 16;       // 14 dims + 2 zero pad
     public const int K = 5;
@@ -285,18 +286,33 @@ public unsafe class FraudDetector
     }
 
     // L2² entre query (Vector256<short>) e a ref no índice refIdx.
-    // Acumula em long pra evitar overflow na soma das 16 lanes.
+    // Com Scale=32767 (igual ao gabarito), diff cabe em int mas diff² estoura int.
+    // Estratégia: widen short→int antes de subtrair, depois Avx2.Multiply (vpmuldq)
+    // pra fazer i32×i32→i64 em SIMD, somando lanes ao final em long.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long DistByQuery(Vector256<short> qVec, short* vectors, int refIdx)
     {
         var v = Vector256.Load(vectors + refIdx * DataLoader.Stride);
-        var diff = qVec - v;                          // 16 shorts (Scale=8192 ≤ 16384, no overflow)
-        var (dLo, dHi) = Vector256.Widen(diff);       // 8 ints + 8 ints
-        var sqLo = dLo * dLo;                          // 8 ints (≤ 268M cada)
-        var sqHi = dHi * dHi;
-        var (sqLoLo, sqLoHi) = Vector256.Widen(sqLo); // 4 longs + 4 longs
-        var (sqHiLo, sqHiHi) = Vector256.Widen(sqHi);
-        var sum = (sqLoLo + sqLoHi) + (sqHiLo + sqHiHi);
+        var (qLo, qHi) = Vector256.Widen(qVec);   // 8 ints + 8 ints, valor pleno preservado
+        var (vLo, vHi) = Vector256.Widen(v);
+        var dLo = qLo - vLo;                       // 8 ints, lanes em [-65534, 65534]
+        var dHi = qHi - vHi;
+
+        // Avx2.Multiply pega o low 32 de cada 64-bit lane e faz i32×i32→i64.
+        // dLo tem 8 i32; visto como i64 são 4 lanes [d0|d1, d2|d3, d4|d5, d6|d7].
+        // Multiply(dLo, dLo) → 4 i64: [d0², d2², d4², d6²]
+        // Após shr32, low de cada 64-bit lane vira d1, d3, d5, d7 → [d1², d3², d5², d7²]
+        var sqLoEven = Avx2.Multiply(dLo, dLo);
+        var sqLoOdd  = Avx2.Multiply(
+            Avx2.ShiftRightLogical(dLo.AsInt64(), 32).AsInt32(),
+            Avx2.ShiftRightLogical(dLo.AsInt64(), 32).AsInt32());
+
+        var sqHiEven = Avx2.Multiply(dHi, dHi);
+        var sqHiOdd  = Avx2.Multiply(
+            Avx2.ShiftRightLogical(dHi.AsInt64(), 32).AsInt32(),
+            Avx2.ShiftRightLogical(dHi.AsInt64(), 32).AsInt32());
+
+        var sum = (sqLoEven + sqLoOdd) + (sqHiEven + sqHiOdd);  // 4 i64 lanes
         return Vector256.Sum(sum);
     }
 

@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-const int Scale = 8192;
+const int Scale = 32_767;
 const int Dim = 14;
 const int Stride = 16;     // 14 dims + 2 zero pad (cacheline-friendly)
 const int LeafSize = 32;
