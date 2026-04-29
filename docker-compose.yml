@@ -1,12 +1,12 @@
 x-api: &api
-  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202604290109
+  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202604290120
   volumes:
     - sock:/run/sock
   deploy:
     resources:
       limits:
-        cpus: "0.4"
-        memory: "160M"
+        cpus: "0.35"
+        memory: "165M"
 
 services:
   api1:
@@ -29,12 +29,11 @@ services:
     depends_on:
       - api1
       - api2
-    cpuset: "0,2"
     deploy:
       resources:
         limits:
-          cpus: "0.2"
-          memory: "30M"
+          cpus: "0.3"
+          memory: "20M"
 
 volumes:
   sock:
