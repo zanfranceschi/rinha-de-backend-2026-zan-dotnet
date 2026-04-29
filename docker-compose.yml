@@ -5,8 +5,8 @@ x-api: &api
   deploy:
     resources:
       limits:
-        cpus: "0.4"
-        memory: "170M"
+        cpus: "0.38"
+        memory: "165M"
 
 services:
   api1:
@@ -32,8 +32,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
-          memory: "10M"
+          cpus: "0.22"
+          memory: "20M"
 
 volumes:
   sock:
