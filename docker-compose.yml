@@ -1,5 +1,5 @@
 x-api: &api
-  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202604280532
+  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202604290047
   volumes:
     - sock:/run/sock
   deploy:
