@@ -13,6 +13,7 @@ public struct VpNode
 {
     public int PivotIdx;    // -1 quando o nó é folha
     public long Radius;
+    public double SqrtRadius;
     public int Left;
     public int Right;
     public int LeafStart;   // offset em LeafIndices
@@ -175,7 +176,7 @@ public static class Vectorizer
 
 public unsafe class FraudDetector
 {
-    private readonly DataLoader _data;
+    public readonly DataLoader Data;
     private readonly short* _vectors;
     private readonly VpNode* _nodes;
     private readonly int* _leafIndices;
@@ -186,7 +187,7 @@ public unsafe class FraudDetector
 
     public FraudDetector(DataLoader data)
     {
-        _data = data;
+        Data = data;
         _vectors = data.Vectors;
         _nodes = data.Nodes;
         _leafIndices = data.LeafIndices;
@@ -209,11 +210,18 @@ public unsafe class FraudDetector
     public int FraudCount(FraudRequest req)
     {
         Span<short> query = stackalloc short[DataLoader.Stride];
-        Vectorizer.Vectorize(req, _data.Normalization, _data.MccRisk, query);
+        Vectorizer.Vectorize(req, Data.Normalization, Data.MccRisk, query);
         return SearchKnn(query);
     }
 
-    private int SearchKnn(ReadOnlySpan<short> query)
+    private static long _sNodesVisited;
+    private static long _sLeafDists;
+    private static long _sPivotDists;
+    private static long _sPruned;
+    private static long _sNotPruned;
+    private static long _sSearchCalls;
+
+    public int SearchKnn(ReadOnlySpan<short> query)
     {
         if (_nodeCount == 0) return 0;
 
@@ -233,14 +241,22 @@ public unsafe class FraudDetector
 
         var qVec = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(query));
 
+        int nodesVisited = 0;
+        int leafDists = 0;
+        int pivotDists = 0;
+        int pruned = 0;
+        int notPruned = 0;
+
         while (stackLen > 0)
         {
             int nodeIdx = stack[--stackLen];
             VpNode* node = nodes + nodeIdx;
+            nodesVisited++;
 
             if (node->LeafLen > 0)
             {
                 int leafEnd = node->LeafStart + node->LeafLen;
+                leafDists += node->LeafLen;
                 for (int i = node->LeafStart; i < leafEnd; i++)
                 {
                     int refIdx = leafIndices[i];
@@ -252,14 +268,13 @@ public unsafe class FraudDetector
 
             int pivotIdx = node->PivotIdx;
             long pivotDist = DistByQuery(qVec, vectors, pivotIdx);
+            pivotDists++;
             InsertTopK(bestD, bestId, ref found, pivotIdx, pivotDist, k);
 
             int near, far;
             if (pivotDist <= node->Radius) { near = node->Left;  far = node->Right; }
             else                            { near = node->Right; far = node->Left;  }
 
-            // Poda VP-tree: pula a sub-árvore far se a distância garantida pelo
-            // anel em volta do pivot já é > worst do top-k atual.
             bool canVisitFar = false;
             if (far != DataLoader.VpNone)
             {
@@ -268,15 +283,26 @@ public unsafe class FraudDetector
                 {
                     long worstDist = bestD[k - 1];
                     double pivotNorm = Math.Sqrt(pivotDist);
-                    double radiusNorm = Math.Sqrt(node->Radius);
+                    double radiusNorm = node->SqrtRadius;
                     double worstNorm = Math.Sqrt(worstDist);
                     canVisitFar = Math.Abs(pivotNorm - radiusNorm) <= worstNorm;
                 }
+                if (canVisitFar) notPruned++; else pruned++;
             }
 
-            // Empilha far primeiro pra near sair antes (LIFO).
             if (canVisitFar) stack[stackLen++] = far;
             if (near != DataLoader.VpNone) stack[stackLen++] = near;
+        }
+
+        Interlocked.Add(ref _sNodesVisited, nodesVisited);
+        Interlocked.Add(ref _sLeafDists, leafDists);
+        Interlocked.Add(ref _sPivotDists, pivotDists);
+        Interlocked.Add(ref _sPruned, pruned);
+        Interlocked.Add(ref _sNotPruned, notPruned);
+        var n = Interlocked.Increment(ref _sSearchCalls);
+        if (n % 100 == 0)
+        {
+            Console.WriteLine($"[SEARCH n={n}] nodes={Interlocked.Read(ref _sNodesVisited)/n} leafDists={Interlocked.Read(ref _sLeafDists)/n} pivotDists={Interlocked.Read(ref _sPivotDists)/n} pruned={Interlocked.Read(ref _sPruned)/n} notPruned={Interlocked.Read(ref _sNotPruned)/n} (avg/req)");
         }
 
         int fraudCount = 0;

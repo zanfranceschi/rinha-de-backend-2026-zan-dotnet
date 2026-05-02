@@ -1,12 +1,14 @@
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 const int Scale = 32_767;
 const int Dim = 14;
 const int Stride = 16;     // 14 dims + 2 zero pad (cacheline-friendly)
-const int LeafSize = 32;
+var LeafSize = args.Length > 4 ? int.Parse(args[4]) : 32;
 const int VpNone = -1;
 const int PivotSampleSize = 64;
 const int MaxStackCapacity = 256;
@@ -17,6 +19,7 @@ var resourcesPath = args.Length > 0
 
 var k = args.Length > 1 ? int.Parse(args[1]) : 0;
 var maxIterations = args.Length > 2 ? int.Parse(args[2]) : 50;
+var batchSize = args.Length > 3 ? int.Parse(args[3]) : 10000;
 
 Console.WriteLine($"Loading references from {resourcesPath}...");
 List<Reference> references;
@@ -40,8 +43,10 @@ if (k > 0)
     var legitK = k - fraudK;
     Console.WriteLine($"Clustering: {fraudK} fraud + {legitK} legit centroids");
 
-    fraudCentroids = KMeans(fraud, fraudK, maxIterations);
-    legitCentroids = KMeans(legit, legitK, maxIterations);
+    Console.WriteLine($"--- KMeans fraud ({fraudK} centroids) ---");
+    fraudCentroids = KMeans(fraud, fraudK, maxIterations, batchSize);
+    Console.WriteLine($"--- KMeans legit ({legitK} centroids) ---");
+    legitCentroids = KMeans(legit, legitK, maxIterations, batchSize);
 }
 else
 {
@@ -150,6 +155,7 @@ int BuildVpNode(short[] vectors, Span<int> indices, List<VpNode> nodes, List<int
     {
         PivotIdx = pivotIdx,
         Radius = radius,
+        SqrtRadius = Math.Sqrt(radius),
         Left = left,
         Right = right,
         LeafStart = 0,
@@ -239,74 +245,96 @@ void NthElement(PointDist[] arr, int n)
     }
 }
 
-static double[][] KMeans(List<double[]> vectors, int k, int maxIterations)
+static double[][] KMeans(List<double[]> vectors, int k, int maxIterations, int batchSize)
 {
     var dims = vectors[0].Length;
     var rng = new Random(42);
     var centroids = new double[k][];
     var indices = Enumerable.Range(0, vectors.Count).OrderBy(_ => rng.Next()).Take(k).ToList();
     for (int i = 0; i < k; i++) centroids[i] = (double[])vectors[indices[i]].Clone();
-    var assignments = new int[vectors.Count];
+
+    var allIndices = Enumerable.Range(0, vectors.Count).ToArray();
+    var counts = new long[k];
+    var sw = System.Diagnostics.Stopwatch.StartNew();
 
     for (int iter = 0; iter < maxIterations; iter++)
     {
-        var changed = 0;
-        for (int v = 0; v < vectors.Count; v++)
+        // Shuffle e pega batch
+        for (int i = allIndices.Length - 1; i > 0; i--)
         {
-            var nearest = 0;
-            var nearestDist = SquaredDistance(vectors[v], centroids[0]);
-            for (int c = 1; c < k; c++)
-            {
-                var dist = SquaredDistance(vectors[v], centroids[c]);
-                if (dist < nearestDist) { nearestDist = dist; nearest = c; }
-            }
-            if (assignments[v] != nearest) { assignments[v] = nearest; changed++; }
+            int j = rng.Next(i + 1);
+            (allIndices[i], allIndices[j]) = (allIndices[j], allIndices[i]);
         }
-        if (changed == 0) break;
+        int batch = Math.Min(batchSize, vectors.Count);
 
-        var sums = new double[k][];
-        var counts = new int[k];
-        for (int c = 0; c < k; c++) sums[c] = new double[dims];
-        for (int v = 0; v < vectors.Count; v++)
+        // Build VP-tree nos centroides pra assign O(log k)
+        var tree = new CentroidVpTree(centroids);
+
+        // Assign batch em paralelo
+        var batchAssign = new int[batch];
+        Parallel.For(0, batch, v =>
         {
-            var c = assignments[v];
+            batchAssign[v] = tree.FindNearest(vectors[allIndices[v]]);
+        });
+
+        // Atualiza centroides com média móvel
+        for (int v = 0; v < batch; v++)
+        {
+            int c = batchAssign[v];
             counts[c]++;
-            for (int d = 0; d < dims; d++) sums[c][d] += vectors[v][d];
+            double lr = 1.0 / counts[c];
+            var vec = vectors[allIndices[v]];
+            var cent = centroids[c];
+            for (int d = 0; d < dims; d++)
+                cent[d] += lr * (vec[d] - cent[d]);
         }
-        for (int c = 0; c < k; c++)
-        {
-            if (counts[c] == 0) centroids[c] = (double[])vectors[rng.Next(vectors.Count)].Clone();
-            else for (int d = 0; d < dims; d++) centroids[c][d] = sums[c][d] / counts[c];
-        }
+
+        Console.WriteLine($"  iter {iter}: {sw.ElapsedMilliseconds}ms (batch={batch})");
     }
 
-    for (int c = 0; c < k; c++)
+    // Build VP-tree final pra assign e snap
+    Console.WriteLine("  Building final VP-tree on centroids...");
+    var finalTree = new CentroidVpTree(centroids);
+
+    Console.WriteLine("  Assigning all vectors to nearest centroid...");
+    var swSnap = System.Diagnostics.Stopwatch.StartNew();
+    var assignments = new int[vectors.Count];
+    Parallel.For(0, vectors.Count, v =>
     {
-        var bestDist = double.MaxValue;
+        assignments[v] = finalTree.FindNearest(vectors[v]);
+    });
+    Console.WriteLine($"  Assignments done in {swSnap.ElapsedMilliseconds}ms");
+
+    Console.WriteLine("  Snapping centroids to nearest real vector...");
+    swSnap.Restart();
+    var clusters = new List<int>[k];
+    for (int c = 0; c < k; c++) clusters[c] = new List<int>();
+    for (int v = 0; v < vectors.Count; v++) clusters[assignments[v]].Add(v);
+
+    Parallel.For(0, k, c =>
+    {
+        double bestDist = double.MaxValue;
         double[]? bestVec = null;
-        for (int v = 0; v < vectors.Count; v++)
+        foreach (int v in clusters[c])
         {
-            if (assignments[v] != c) continue;
-            var dist = SquaredDistance(vectors[v], centroids[c]);
+            double dist = SquaredDistance(vectors[v], centroids[c]);
             if (dist < bestDist) { bestDist = dist; bestVec = vectors[v]; }
         }
         if (bestVec is not null) centroids[c] = bestVec;
-    }
+    });
+    Console.WriteLine($"  Snap done in {swSnap.ElapsedMilliseconds}ms");
+
     return centroids;
 }
 
-static double SquaredDistance(double[] a, double[] b)
-{
-    double sum = 0;
-    for (int i = 0; i < a.Length; i++) { var diff = a[i] - b[i]; sum += diff * diff; }
-    return sum;
-}
+static double SquaredDistance(double[] a, double[] b) => CentroidVpTree.Dist(a, b);
 
 [StructLayout(LayoutKind.Sequential)]
 struct VpNode
 {
     public int PivotIdx;
     public long Radius;
+    public double SqrtRadius;
     public int Left;
     public int Right;
     public int LeafStart;
@@ -325,3 +353,150 @@ record Reference(
 
 [JsonSerializable(typeof(List<Reference>))]
 internal partial class RefJsonContext : JsonSerializerContext { }
+
+class CentroidVpTree
+{
+    private readonly double[][] _centroids;
+    private readonly int[] _pivots;
+    private readonly double[] _radii;
+    private readonly int[] _left;
+    private readonly int[] _right;
+    private readonly int[][] _leaves;
+    private int _count;
+    private const int TreeLeafSize = 16;
+
+    public CentroidVpTree(double[][] centroids)
+    {
+        _centroids = centroids;
+        int n = centroids.Length;
+        int maxNodes = Math.Max(4, 4 * n / TreeLeafSize);
+        _pivots = new int[maxNodes];
+        _radii = new double[maxNodes];
+        _left = new int[maxNodes];
+        _right = new int[maxNodes];
+        _leaves = new int[maxNodes][];
+        _count = 0;
+
+        var idx = Enumerable.Range(0, n).ToArray();
+        Build(idx, 0, n);
+    }
+
+    private int Build(int[] idx, int from, int to)
+    {
+        int nodeId = _count++;
+        int len = to - from;
+
+        if (len <= TreeLeafSize)
+        {
+            _pivots[nodeId] = -1;
+            _leaves[nodeId] = idx[from..to];
+            return nodeId;
+        }
+
+        int seed = idx[from];
+        int bestPivotPos = from;
+        double bestDist = 0;
+        for (int i = from; i < to; i++)
+        {
+            double d = Dist(_centroids[seed], _centroids[idx[i]]);
+            if (d > bestDist) { bestDist = d; bestPivotPos = i; }
+        }
+        (idx[bestPivotPos], idx[to - 1]) = (idx[to - 1], idx[bestPivotPos]);
+        int pivotIdx = idx[to - 1];
+        _pivots[nodeId] = pivotIdx;
+
+        int candLen = len - 1;
+        var dists = new (int pos, double dist)[candLen];
+        for (int i = 0; i < candLen; i++)
+            dists[i] = (from + i, Dist(_centroids[pivotIdx], _centroids[idx[from + i]]));
+
+        Array.Sort(dists, (a, b) => a.dist.CompareTo(b.dist));
+        int mid = candLen / 2;
+        _radii[nodeId] = dists[mid].dist;
+
+        var sorted = new int[candLen];
+        for (int i = 0; i < candLen; i++)
+            sorted[i] = idx[dists[i].pos];
+        Array.Copy(sorted, 0, idx, from, candLen);
+
+        int leftEnd = from + mid + 1;
+        _left[nodeId] = Build(idx, from, leftEnd);
+        _right[nodeId] = (leftEnd < to - 1) ? Build(idx, leftEnd, to - 1) : -1;
+
+        return nodeId;
+    }
+
+    public int FindNearest(double[] query)
+    {
+        int bestIdx = 0;
+        double bestDist = double.MaxValue;
+        Search(0, query, ref bestIdx, ref bestDist);
+        return bestIdx;
+    }
+
+    private void Search(int nodeId, double[] query, ref int bestIdx, ref double bestDist)
+    {
+        if (nodeId < 0) return;
+
+        if (_pivots[nodeId] == -1)
+        {
+            var leaf = _leaves[nodeId];
+            for (int i = 0; i < leaf.Length; i++)
+            {
+                double d = Dist(query, _centroids[leaf[i]]);
+                if (d < bestDist) { bestDist = d; bestIdx = leaf[i]; }
+            }
+            return;
+        }
+
+        int pivot = _pivots[nodeId];
+        double pivotDist = Dist(query, _centroids[pivot]);
+        if (pivotDist < bestDist) { bestDist = pivotDist; bestIdx = pivot; }
+
+        double radius = _radii[nodeId];
+        double pivotNorm = Math.Sqrt(pivotDist);
+        double radiusNorm = Math.Sqrt(radius);
+        double worstNorm = Math.Sqrt(bestDist);
+
+        if (pivotDist <= radius)
+        {
+            Search(_left[nodeId], query, ref bestIdx, ref bestDist);
+            worstNorm = Math.Sqrt(bestDist);
+            if (_right[nodeId] >= 0 && Math.Abs(pivotNorm - radiusNorm) <= worstNorm)
+                Search(_right[nodeId], query, ref bestIdx, ref bestDist);
+        }
+        else
+        {
+            if (_right[nodeId] >= 0)
+                Search(_right[nodeId], query, ref bestIdx, ref bestDist);
+            worstNorm = Math.Sqrt(bestDist);
+            if (Math.Abs(pivotNorm - radiusNorm) <= worstNorm)
+                Search(_left[nodeId], query, ref bestIdx, ref bestDist);
+        }
+    }
+
+    public static double Dist(double[] a, double[] b)
+    {
+        var a0 = Vector256.LoadUnsafe(ref a[0]);
+        var b0 = Vector256.LoadUnsafe(ref b[0]);
+        var d0 = a0 - b0;
+        var acc0 = Avx.Multiply(d0, d0);
+
+        var a1 = Vector256.LoadUnsafe(ref a[4]);
+        var b1 = Vector256.LoadUnsafe(ref b[4]);
+        var d1 = a1 - b1;
+        var acc1 = Avx.Multiply(d1, d1);
+
+        var a2 = Vector256.LoadUnsafe(ref a[8]);
+        var b2 = Vector256.LoadUnsafe(ref b[8]);
+        var d2 = a2 - b2;
+        acc0 = Avx.Add(acc0, Avx.Multiply(d2, d2));
+
+        double s12 = a[12] - b[12]; s12 *= s12;
+        double s13 = a[13] - b[13]; s13 *= s13;
+
+        var sum = Avx.Add(acc0, acc1);
+        return Vector256.Sum(sum) + s12 + s13;
+    }
+}
+
