@@ -1,5 +1,5 @@
 x-api: &api
-  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202605022213
+  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202605022303
   volumes:
     - sock:/run/sock
   deploy:
@@ -14,7 +14,7 @@ services:
     environment:
       SOCKET_PATH: /run/sock/api1.sock
       Logging__LogLevel__Default: None
-      NPROBE: 69
+      NPROBE: 20
       INSTRUMENTED: "false"
 
   api2:
@@ -22,7 +22,7 @@ services:
     environment:
       SOCKET_PATH: /run/sock/api2.sock
       Logging__LogLevel__Default: None
-      NPROBE: 69
+      NPROBE: 20
       INSTRUMENTED: "false"
 
   nginx:
