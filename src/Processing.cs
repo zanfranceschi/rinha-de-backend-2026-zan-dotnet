@@ -8,40 +8,26 @@ using Rinha2026.Models;
 
 namespace Rinha2026.Services;
 
-[StructLayout(LayoutKind.Sequential)]
-public struct VpNode
-{
-    public int PivotIdx;    // -1 quando o nó é folha
-    public long Radius;
-    public double SqrtRadius;
-    public int Left;
-    public int Right;
-    public int LeafStart;   // offset em LeafIndices
-    public int LeafLen;     // > 0 quando folha; 0 quando interno
-}
-
 public unsafe class DataLoader : IDisposable
 {
-    public const int Scale = 32_767;
+    public const int Scale = 10_000;
     public const int Dim = 14;
-    public const int Stride = 16;       // 14 dims + 2 zero pad
+    public const int Stride = 16;       // 14 dims + 2 zero pad (centroids only)
     public const int K = 5;
-    public const int VpNone = -1;
-    public const int MaxStackCapacity = 256;
 
     public Dictionary<string, double> MccRisk { get; }
     public NormalizationConfig Normalization { get; }
-    public byte[] Labels { get; }       // pequeno, fica em managed heap
+    public byte[] Labels { get; }
     public int Count { get; }
-    public int NodeCount { get; }
-    public int IndicesCount { get; }
+    public int NClusters { get; }
 
-    // Os 3 maiores buffers ficam em memória nativa (NativeMemory.Alloc) pra não
-    // contar contra o GC heap hard limit (~75% do cgroup). Sobra heap gerenciado
-    // suficiente pra Kestrel/JSON sob carga sem cair em managed OOM.
-    public short* Vectors { get; }       // Count * Stride
-    public VpNode* Nodes { get; }        // NodeCount
-    public int* LeafIndices { get; }     // IndicesCount
+    public float* Centroids { get; }         // NClusters * Stride
+    public short* BboxMin { get; }           // NClusters * Dim
+    public short* BboxMax { get; }           // NClusters * Dim
+    public int* Offsets { get; }             // NClusters + 1 (cumulative)
+    public short*[] Dims { get; }            // Dim pointers, each to Count shorts (column-major)
+
+    private short* _dimData;                 // single allocation for all column-major data
 
     public DataLoader(string resourcesPath)
     {
@@ -53,7 +39,14 @@ public unsafe class DataLoader : IDisposable
             File.ReadAllText(Path.Combine(resourcesPath, "normalization.json")),
             AppJsonContext.Default.NormalizationConfig)!;
 
-        // Formato v5: [int32 count][N*Stride shorts][N labels][int32 nodeCount][nodes][int32 indCount][indices]
+        // Format IVF v2:
+        //   [int32 count][int32 nClusters]
+        //   [nClusters * Stride * float32 (centroids)]
+        //   [nClusters * Dim * int16 (bbox_min)]
+        //   [nClusters * Dim * int16 (bbox_max)]
+        //   [(nClusters+1) * int32 (cumulative offsets)]
+        //   [Dim * count * int16 (column-major vectors, cluster-sorted)]
+        //   [count * byte (labels, cluster-sorted)]
         using var fs = File.OpenRead(Path.Combine(resourcesPath, "references.bin"));
 
         Span<byte> intBuf = stackalloc byte[4];
@@ -61,24 +54,33 @@ public unsafe class DataLoader : IDisposable
         fs.ReadExactly(intBuf);
         Count = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
 
-        long vecBytes = (long)Count * Stride * sizeof(short);
-        Vectors = (short*)NativeMemory.AllocZeroed((nuint)vecBytes);
-        ReadExact(fs, (byte*)Vectors, vecBytes);
+        fs.ReadExactly(intBuf);
+        NClusters = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
+
+        long centroidBytes = (long)NClusters * Stride * sizeof(float);
+        Centroids = (float*)NativeMemory.AllocZeroed((nuint)centroidBytes);
+        ReadExact(fs, (byte*)Centroids, centroidBytes);
+
+        long bboxBytes = (long)NClusters * Dim * sizeof(short);
+        BboxMin = (short*)NativeMemory.AllocZeroed((nuint)bboxBytes);
+        ReadExact(fs, (byte*)BboxMin, bboxBytes);
+        BboxMax = (short*)NativeMemory.AllocZeroed((nuint)bboxBytes);
+        ReadExact(fs, (byte*)BboxMax, bboxBytes);
+
+        long offsetBytes = (long)(NClusters + 1) * sizeof(int);
+        Offsets = (int*)NativeMemory.AllocZeroed((nuint)offsetBytes);
+        ReadExact(fs, (byte*)Offsets, offsetBytes);
+
+        long dimDataBytes = (long)Dim * Count * sizeof(short);
+        _dimData = (short*)NativeMemory.AllocZeroed((nuint)dimDataBytes);
+        ReadExact(fs, (byte*)_dimData, dimDataBytes);
+
+        Dims = new short*[Dim];
+        for (int d = 0; d < Dim; d++)
+            Dims[d] = _dimData + (long)d * Count;
 
         Labels = new byte[Count];
         fs.ReadExactly(Labels);
-
-        fs.ReadExactly(intBuf);
-        NodeCount = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
-        long nodeBytes = (long)NodeCount * sizeof(VpNode);
-        Nodes = (VpNode*)NativeMemory.AllocZeroed((nuint)nodeBytes);
-        ReadExact(fs, (byte*)Nodes, nodeBytes);
-
-        fs.ReadExactly(intBuf);
-        IndicesCount = BinaryPrimitives.ReadInt32LittleEndian(intBuf);
-        long indBytes = (long)IndicesCount * sizeof(int);
-        LeafIndices = (int*)NativeMemory.AllocZeroed((nuint)indBytes);
-        ReadExact(fs, (byte*)LeafIndices, indBytes);
     }
 
     private static void ReadExact(Stream s, byte* dst, long total)
@@ -95,9 +97,11 @@ public unsafe class DataLoader : IDisposable
 
     public void Dispose()
     {
-        if (Vectors != null) NativeMemory.Free(Vectors);
-        if (Nodes != null) NativeMemory.Free(Nodes);
-        if (LeafIndices != null) NativeMemory.Free(LeafIndices);
+        if (Centroids != null) NativeMemory.Free(Centroids);
+        if (BboxMin != null) NativeMemory.Free(BboxMin);
+        if (BboxMax != null) NativeMemory.Free(BboxMax);
+        if (Offsets != null) NativeMemory.Free(Offsets);
+        if (_dimData != null) NativeMemory.Free(_dimData);
     }
 }
 
@@ -177,22 +181,40 @@ public static class Vectorizer
 public unsafe class FraudDetector
 {
     public readonly DataLoader Data;
-    private readonly short* _vectors;
-    private readonly VpNode* _nodes;
-    private readonly int* _leafIndices;
+    private readonly float* _centroids;
+    private readonly short* _bboxMin;
+    private readonly short* _bboxMax;
+    private readonly int* _offsets;
+    private readonly short*[] _dims;
     private readonly byte[] _labels;
-    private readonly int _nodeCount;
+    private readonly int _nClusters;
+
+    // Dimension order for early exit: high-variance continuous dims first, binary/cyclic last
+    // (same order as the reference C implementation)
+    private static readonly int[] DimOrder = { 5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4 };
+
+    public int NProbe { get; }
+    public bool Instrumented { get; }
 
     public static readonly byte[][] PrecomputedResponses = BuildResponses();
 
     public FraudDetector(DataLoader data)
     {
         Data = data;
-        _vectors = data.Vectors;
-        _nodes = data.Nodes;
-        _leafIndices = data.LeafIndices;
+        _centroids = data.Centroids;
+        _bboxMin = data.BboxMin;
+        _bboxMax = data.BboxMax;
+        _offsets = data.Offsets;
+        _dims = data.Dims;
         _labels = data.Labels;
-        _nodeCount = data.NodeCount;
+        _nClusters = data.NClusters;
+
+        var nprobeEnv = Environment.GetEnvironmentVariable("NPROBE");
+        NProbe = nprobeEnv != null ? int.Parse(nprobeEnv) : 8;
+
+        Instrumented = string.Equals(Environment.GetEnvironmentVariable("INSTRUMENTED"), "true", StringComparison.OrdinalIgnoreCase);
+
+        Console.WriteLine($"IVF: {_nClusters} clusters, nprobe={NProbe}, instrumented={Instrumented}");
     }
 
     private static byte[][] BuildResponses()
@@ -214,95 +236,88 @@ public unsafe class FraudDetector
         return SearchKnn(query);
     }
 
-    private static long _sNodesVisited;
-    private static long _sLeafDists;
-    private static long _sPivotDists;
-    private static long _sPruned;
-    private static long _sNotPruned;
+    private static long _sDistComps;
     private static long _sSearchCalls;
 
     public int SearchKnn(ReadOnlySpan<short> query)
     {
-        if (_nodeCount == 0) return 0;
-
+        int nClusters = _nClusters;
+        int nprobe = Math.Min(NProbe, nClusters);
         int k = DataLoader.K;
         var labels = _labels;
-        VpNode* nodes = _nodes;
-        int* leafIndices = _leafIndices;
-        short* vectors = _vectors;
+        float* centroids = _centroids;
+        short* bboxMin = _bboxMin;
+        short* bboxMax = _bboxMax;
+        int* offsets = _offsets;
+        var dims = _dims;
 
+        // Find nprobe closest centroids (float centroids)
+        Span<float> probeDist = stackalloc float[nprobe];
+        Span<int> probeIdx = stackalloc int[nprobe];
+        probeDist.Fill(float.MaxValue);
+
+        for (int c = 0; c < nClusters; c++)
+        {
+            float dist = DistByCentroidFloat(query, centroids, c);
+            if (dist < probeDist[nprobe - 1])
+            {
+                int pos = nprobe - 1;
+                while (pos > 0 && probeDist[pos - 1] > dist) { probeDist[pos] = probeDist[pos - 1]; probeIdx[pos] = probeIdx[pos - 1]; pos--; }
+                probeDist[pos] = dist;
+                probeIdx[pos] = c;
+            }
+        }
+
+        // Search vectors in the nprobe closest clusters
         Span<long> bestD = stackalloc long[5] { long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue };
         Span<int> bestId = stackalloc int[5];
         int found = 0;
+        int distComps = 0;
 
-        Span<int> stack = stackalloc int[DataLoader.MaxStackCapacity];
-        int stackLen = 1;
-        stack[0] = 0;
-
-        var qVec = Vector256.LoadUnsafe(ref MemoryMarshal.GetReference(query));
-
-        int nodesVisited = 0;
-        int leafDists = 0;
-        int pivotDists = 0;
-        int pruned = 0;
-        int notPruned = 0;
-
-        while (stackLen > 0)
+        for (int p = 0; p < nprobe; p++)
         {
-            int nodeIdx = stack[--stackLen];
-            VpNode* node = nodes + nodeIdx;
-            nodesVisited++;
+            int clusterId = probeIdx[p];
 
-            if (node->LeafLen > 0)
+            // Bbox pruning: skip cluster if lower bound > worst in top-5
+            if (found >= k)
             {
-                int leafEnd = node->LeafStart + node->LeafLen;
-                leafDists += node->LeafLen;
-                for (int i = node->LeafStart; i < leafEnd; i++)
-                {
-                    int refIdx = leafIndices[i];
-                    long dist = DistByQuery(qVec, vectors, refIdx);
-                    InsertTopK(bestD, bestId, ref found, refIdx, dist, k);
-                }
-                continue;
+                long lb = BboxLowerBound(query, bboxMin, bboxMax, clusterId);
+                if (lb > bestD[k - 1]) continue;
             }
 
-            int pivotIdx = node->PivotIdx;
-            long pivotDist = DistByQuery(qVec, vectors, pivotIdx);
-            pivotDists++;
-            InsertTopK(bestD, bestId, ref found, pivotIdx, pivotDist, k);
+            int clusterStart = offsets[clusterId];
+            int clusterEnd = offsets[clusterId + 1];
+            int size = clusterEnd - clusterStart;
+            distComps += size;
 
-            int near, far;
-            if (pivotDist <= node->Radius) { near = node->Left;  far = node->Right; }
-            else                            { near = node->Right; far = node->Left;  }
-
-            bool canVisitFar = false;
-            if (far != DataLoader.VpNone)
+            // Column-major scan with early exit per dimension
+            for (int i = clusterStart; i < clusterEnd; i++)
             {
-                if (found < k) canVisitFar = true;
-                else
-                {
-                    long worstDist = bestD[k - 1];
-                    double pivotNorm = Math.Sqrt(pivotDist);
-                    double radiusNorm = node->SqrtRadius;
-                    double worstNorm = Math.Sqrt(worstDist);
-                    canVisitFar = Math.Abs(pivotNorm - radiusNorm) <= worstNorm;
-                }
-                if (canVisitFar) notPruned++; else pruned++;
-            }
+                long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
+                long dist = 0;
+                bool pruned = false;
 
-            if (canVisitFar) stack[stackLen++] = far;
-            if (near != DataLoader.VpNone) stack[stackLen++] = near;
+                for (int di = 0; di < DataLoader.Dim; di++)
+                {
+                    int d = DimOrder[di];
+                    long diff = query[d] - dims[d][i];
+                    dist += diff * diff;
+                    if (dist > worstD) { pruned = true; break; }
+                }
+
+                if (!pruned)
+                    InsertTopK(bestD, bestId, ref found, i, dist, k);
+            }
         }
 
-        Interlocked.Add(ref _sNodesVisited, nodesVisited);
-        Interlocked.Add(ref _sLeafDists, leafDists);
-        Interlocked.Add(ref _sPivotDists, pivotDists);
-        Interlocked.Add(ref _sPruned, pruned);
-        Interlocked.Add(ref _sNotPruned, notPruned);
-        var n = Interlocked.Increment(ref _sSearchCalls);
-        if (n % 100 == 0)
+        if (Instrumented)
         {
-            Console.WriteLine($"[SEARCH n={n}] nodes={Interlocked.Read(ref _sNodesVisited)/n} leafDists={Interlocked.Read(ref _sLeafDists)/n} pivotDists={Interlocked.Read(ref _sPivotDists)/n} pruned={Interlocked.Read(ref _sPruned)/n} notPruned={Interlocked.Read(ref _sNotPruned)/n} (avg/req)");
+            Interlocked.Add(ref _sDistComps, distComps);
+            var n = Interlocked.Increment(ref _sSearchCalls);
+            if (n % 100 == 0)
+            {
+                Console.WriteLine($"[IVF n={n}] avgDistComps={Interlocked.Read(ref _sDistComps)/n} nprobe={nprobe} (avg/req)");
+            }
         }
 
         int fraudCount = 0;
@@ -311,35 +326,35 @@ public unsafe class FraudDetector
         return fraudCount;
     }
 
-    // L2² entre query (Vector256<short>) e a ref no índice refIdx.
-    // Com Scale=32767 (igual ao gabarito), diff cabe em int mas diff² estoura int.
-    // Estratégia: widen short→int antes de subtrair, depois Avx2.Multiply (vpmuldq)
-    // pra fazer i32×i32→i64 em SIMD, somando lanes ao final em long.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static long DistByQuery(Vector256<short> qVec, short* vectors, int refIdx)
+    private static float DistByCentroidFloat(ReadOnlySpan<short> query, float* centroids, int centroidIdx)
     {
-        var v = Vector256.Load(vectors + refIdx * DataLoader.Stride);
-        var (qLo, qHi) = Vector256.Widen(qVec);   // 8 ints + 8 ints, valor pleno preservado
-        var (vLo, vHi) = Vector256.Widen(v);
-        var dLo = qLo - vLo;                       // 8 ints, lanes em [-65534, 65534]
-        var dHi = qHi - vHi;
+        float* c = centroids + centroidIdx * DataLoader.Stride;
+        float sum = 0;
+        for (int d = 0; d < DataLoader.Dim; d++)
+        {
+            float diff = query[d] - c[d];
+            sum += diff * diff;
+        }
+        return sum;
+    }
 
-        // Avx2.Multiply pega o low 32 de cada 64-bit lane e faz i32×i32→i64.
-        // dLo tem 8 i32; visto como i64 são 4 lanes [d0|d1, d2|d3, d4|d5, d6|d7].
-        // Multiply(dLo, dLo) → 4 i64: [d0², d2², d4², d6²]
-        // Após shr32, low de cada 64-bit lane vira d1, d3, d5, d7 → [d1², d3², d5², d7²]
-        var sqLoEven = Avx2.Multiply(dLo, dLo);
-        var sqLoOdd  = Avx2.Multiply(
-            Avx2.ShiftRightLogical(dLo.AsInt64(), 32).AsInt32(),
-            Avx2.ShiftRightLogical(dLo.AsInt64(), 32).AsInt32());
-
-        var sqHiEven = Avx2.Multiply(dHi, dHi);
-        var sqHiOdd  = Avx2.Multiply(
-            Avx2.ShiftRightLogical(dHi.AsInt64(), 32).AsInt32(),
-            Avx2.ShiftRightLogical(dHi.AsInt64(), 32).AsInt32());
-
-        var sum = (sqLoEven + sqLoOdd) + (sqHiEven + sqHiOdd);  // 4 i64 lanes
-        return Vector256.Sum(sum);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long BboxLowerBound(ReadOnlySpan<short> query, short* bboxMin, short* bboxMax, int clusterId)
+    {
+        long lb = 0;
+        int bboxBase = clusterId * DataLoader.Dim;
+        for (int d = 0; d < DataLoader.Dim; d++)
+        {
+            int q = query[d];
+            int lo = bboxMin[bboxBase + d];
+            int hi = bboxMax[bboxBase + d];
+            int diff = 0;
+            if (q < lo) diff = lo - q;
+            else if (q > hi) diff = q - hi;
+            lb += (long)diff * diff;
+        }
+        return lb;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

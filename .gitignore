@@ -28,3 +28,5 @@ publish/
 Thumbs.db
 resources/references.bin
 resources/references.json.gz
+ref-ivf.md
+falsos positivos.txt

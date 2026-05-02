@@ -70,3 +70,42 @@ Content-Type: application/json
         "km_from_current": 300.0
     }
 }
+
+### 
+POST http://localhost:{{port}}/fraud-score
+Content-Type: application/json
+
+{
+  "id": "tx-3468014206",
+  "transaction": {
+    "amount": 457.52,
+    "installments": 5,
+    "requested_at": "2026-03-25T08:08:35Z"
+  },
+  "customer": {
+    "avg_amount": 317.96,
+    "tx_count_24h": 4,
+    "known_merchants": [
+      "MERC-009",
+      "MERC-011",
+      "MERC-002",
+      "MERC-002",
+      "MERC-010"
+    ]
+  },
+  "merchant": {
+    "id": "MERC-009",
+    "mcc": "5411",
+    "avg_amount": 289.11
+  },
+  "terminal": {
+    "is_online": false,
+    "card_present": true,
+    "km_from_home": 168.1178127015
+  },
+  "last_transaction": {
+    "timestamp": "2026-03-25T06:36:35Z",
+    "km_from_current": 112.32416699
+  }
+}
+

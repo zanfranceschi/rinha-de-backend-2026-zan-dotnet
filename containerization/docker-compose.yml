@@ -14,6 +14,8 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
+      NPROBE: 69
+      INSTRUMENTED: "false"
       Logging__LogLevel__Default: None
     cpuset: "0,1"
 
@@ -21,6 +23,8 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
+      NPROBE: 69
+      INSTRUMENTED: "false"
       Logging__LogLevel__Default: None
     cpuset: "2,3"
 

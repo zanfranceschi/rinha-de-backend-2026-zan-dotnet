@@ -11,7 +11,7 @@ docker build \
     -t "rinha-de-backend-2026-zan-dotnet:latest" \
     -f Dockerfile ..
 
-docker push --all-tags $IMAGE
+# docker push --all-tags $IMAGE
 
 echo "Published $IMAGE:$TAG"
 
