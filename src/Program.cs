@@ -10,7 +10,11 @@ var socketPath = Environment.GetEnvironmentVariable("SOCKET_PATH");
 if (!string.IsNullOrEmpty(socketPath))
 {
     if (File.Exists(socketPath)) File.Delete(socketPath);
-    builder.WebHost.ConfigureKestrel(k => k.ListenUnixSocket(socketPath));
+    builder.WebHost.ConfigureKestrel(k =>
+    {
+        k.AddServerHeader = false;
+        k.ListenUnixSocket(socketPath);
+    });
 }
 
 var resourcesPath = Environment.GetEnvironmentVariable("RESOURCES_PATH")
