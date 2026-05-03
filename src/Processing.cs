@@ -349,6 +349,13 @@ public unsafe class FraudDetector
 
             if (fc is 2 or 3)
             {
+                // Mark already-visited clusters in bitset
+                int bitsetLen = (nClusters + 63) >> 6;
+                Span<ulong> visited = stackalloc ulong[bitsetLen];
+                visited.Clear();
+                for (int p = 0; p < nprobe; p++)
+                    visited[probeIdx[p] >> 6] |= 1UL << (probeIdx[p] & 63);
+
                 // Find maxProbe closest centroids, excluding already-visited ones
                 Span<float> extraDist = stackalloc float[maxProbe];
                 Span<int> extraIdx = stackalloc int[maxProbe];
@@ -356,10 +363,7 @@ public unsafe class FraudDetector
 
                 for (int c = 0; c < nClusters; c++)
                 {
-                    // Skip already probed clusters
-                    bool already = false;
-                    for (int p = 0; p < nprobe; p++) { if (probeIdx[p] == c) { already = true; break; } }
-                    if (already) continue;
+                    if ((visited[c >> 6] & (1UL << (c & 63))) != 0) continue;
 
                     float* cp = centroids + c * DataLoader.Stride;
                     Vector256<float> cv0 = Avx.LoadVector256(cp);
