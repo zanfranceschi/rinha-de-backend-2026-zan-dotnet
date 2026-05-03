@@ -1,5 +1,5 @@
 x-api: &api
-  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202605030438
+  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202605030527
   volumes:
     - sock:/run/sock
   deploy:
@@ -16,7 +16,6 @@ services:
       NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: false
       Logging__LogLevel__Default: None
 
   api2:
@@ -26,7 +25,6 @@ services:
       NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: false
       Logging__LogLevel__Default: None
 
   nginx:
