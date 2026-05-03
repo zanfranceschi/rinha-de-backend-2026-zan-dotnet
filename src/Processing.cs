@@ -1,5 +1,4 @@
 using System.Buffers.Binary;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -177,14 +176,9 @@ public unsafe class FraudDetector
     private readonly byte[] _labels;
     private readonly int _nClusters;
 
-    // Dimension order for early exit: high-variance continuous dims first, binary/cyclic last
-    // (same order as the reference C implementation)
-    private static readonly int[] DimOrder = { 5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4 };
-
     public int NProbe { get; }
     public int NProbeRetryExtra { get; }
     public int K { get; }
-    public bool Instrumented { get; }
 
     public static readonly byte[][] PrecomputedResponses = BuildResponses();
 
@@ -207,10 +201,6 @@ public unsafe class FraudDetector
 
         var kEnv = Environment.GetEnvironmentVariable("KNN_K");
         K = kEnv != null ? int.Parse(kEnv) : DataLoader.K;
-
-        Instrumented = string.Equals(Environment.GetEnvironmentVariable("INSTRUMENTED"), "true", StringComparison.OrdinalIgnoreCase);
-
-        Console.WriteLine($"IVF: {_nClusters} clusters, nprobe={NProbe}, instrumented={Instrumented}");
     }
 
     private static byte[][] BuildResponses()
@@ -227,22 +217,10 @@ public unsafe class FraudDetector
 
     public int FraudCount(in FraudData req)
     {
-        long tv0 = Stopwatch.GetTimestamp();
         Span<short> query = stackalloc short[DataLoader.Stride];
         Vectorizer.Vectorize(in req, Data.Normalization, Data.MccRisk, query);
-        long tv1 = Stopwatch.GetTimestamp();
-        if (Instrumented)
-            Interlocked.Add(ref _sVectorizeTicks, tv1 - tv0);
         return SearchKnn(query);
     }
-
-    private static long _sDistComps;
-    private static long _sSearchCalls;
-    private static long _sCentroidTicks;
-    private static long _sClusterScanTicks;
-    private static long _sRetryTicks;
-    private static long _sRetryCount;
-    private static long _sVectorizeTicks;
 
     public int SearchKnn(ReadOnlySpan<short> query)
     {
@@ -255,8 +233,6 @@ public unsafe class FraudDetector
         short* bboxMax = _bboxMax;
         int* offsets = _offsets;
         var dims = _dims;
-
-        long t0 = Stopwatch.GetTimestamp();
 
         // Precompute query as 2x Vector256<float> for SIMD centroid distance
         Span<float> queryF = stackalloc float[DataLoader.Stride];
@@ -297,14 +273,11 @@ public unsafe class FraudDetector
             }
         }
 
-        long t1 = Stopwatch.GetTimestamp();
-
         // Search vectors in the nprobe closest clusters
         Span<long> bestD = stackalloc long[k];
         bestD.Fill(long.MaxValue);
         Span<int> bestId = stackalloc int[k];
         int found = 0;
-        int distComps = 0;
 
         for (int p = 0; p < nprobe; p++)
         {
@@ -318,13 +291,9 @@ public unsafe class FraudDetector
 
             int clusterStart = offsets[clusterId];
             int clusterEnd = offsets[clusterId + 1];
-            distComps += clusterEnd - clusterStart;
 
             ScanClusterSimd(query, dims, clusterStart, clusterEnd, bestD, bestId, ref found, k);
         }
-
-        long t2 = Stopwatch.GetTimestamp();
-        long retryTicks = 0;
 
         // If borderline, find extra centroids and continue search
         int maxProbe = Math.Min(NProbeRetryExtra, nClusters);
@@ -390,32 +359,9 @@ public unsafe class FraudDetector
 
                     int clusterStart = offsets[clusterId];
                     int clusterEnd = offsets[clusterId + 1];
-                    distComps += clusterEnd - clusterStart;
 
                     ScanClusterSimd(query, dims, clusterStart, clusterEnd, bestD, bestId, ref found, k);
                 }
-
-                retryTicks = Stopwatch.GetTimestamp() - t2;
-                Interlocked.Increment(ref _sRetryCount);
-            }
-        }
-
-        if (Instrumented)
-        {
-            Interlocked.Add(ref _sCentroidTicks, t1 - t0);
-            Interlocked.Add(ref _sClusterScanTicks, t2 - t1);
-            Interlocked.Add(ref _sRetryTicks, retryTicks);
-            Interlocked.Add(ref _sDistComps, distComps);
-            var n = Interlocked.Increment(ref _sSearchCalls);
-            if (n % 100 == 0)
-            {
-                double freq = Stopwatch.Frequency;
-                double avgVec = Interlocked.Read(ref _sVectorizeTicks) / n / freq * 1_000_000;
-                double avgCentroid = Interlocked.Read(ref _sCentroidTicks) / n / freq * 1_000_000;
-                double avgScan = Interlocked.Read(ref _sClusterScanTicks) / n / freq * 1_000_000;
-                long retries = Interlocked.Read(ref _sRetryCount);
-                double avgRetry = retries > 0 ? Interlocked.Read(ref _sRetryTicks) / (double)retries / freq * 1_000_000 : 0;
-                Console.WriteLine($"[IVF n={n}] vec={avgVec:F0}us centroid={avgCentroid:F0}us scan={avgScan:F0}us retry={avgRetry:F0}us(x{retries}) distComps={Interlocked.Read(ref _sDistComps)/n}");
             }
         }
 
@@ -498,19 +444,6 @@ public unsafe class FraudDetector
             InsertTopK(bestD, bestId, ref found, i, dist, k);
             nextTail:;
         }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float DistByCentroidFloat(ReadOnlySpan<short> query, float* centroids, int centroidIdx)
-    {
-        float* c = centroids + centroidIdx * DataLoader.Stride;
-        float sum = 0;
-        for (int d = 0; d < DataLoader.Dim; d++)
-        {
-            float diff = query[d] - c[d];
-            sum += diff * diff;
-        }
-        return sum;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

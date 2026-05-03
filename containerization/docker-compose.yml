@@ -17,7 +17,6 @@ services:
       NPROBE: 1
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: true
       Logging__LogLevel__Default: None
     cpuset: "0,1"
 
@@ -28,7 +27,6 @@ services:
       NPROBE: 1
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: true
       Logging__LogLevel__Default: None
     cpuset: "2,3"
 
