@@ -13,20 +13,20 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
-      NPROBE: 1
+      NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: false
+      INSTRUMENTED: true
       Logging__LogLevel__Default: None
 
   api2:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
-      NPROBE: 1
+      NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: false
+      INSTRUMENTED: true
       Logging__LogLevel__Default: None
 
   nginx:
