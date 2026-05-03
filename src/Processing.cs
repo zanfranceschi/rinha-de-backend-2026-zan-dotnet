@@ -271,6 +271,13 @@ public unsafe class FraudDetector
 
         long t0 = Stopwatch.GetTimestamp();
 
+        // Precompute query as 2x Vector256<float> for SIMD centroid distance
+        Span<float> queryF = stackalloc float[DataLoader.Stride];
+        for (int d = 0; d < DataLoader.Stride; d++)
+            queryF[d] = query[d];
+        Vector256<float> qf0 = Vector256.LoadUnsafe(ref queryF[0]);
+        Vector256<float> qf1 = Vector256.LoadUnsafe(ref queryF[8]);
+
         // Find nprobe closest centroids
         Span<float> probeDist = stackalloc float[nprobe];
         Span<int> probeIdx = stackalloc int[nprobe];
@@ -278,7 +285,22 @@ public unsafe class FraudDetector
 
         for (int c = 0; c < nClusters; c++)
         {
-            float dist = DistByCentroidFloat(query, centroids, c);
+            float* cp = centroids + c * DataLoader.Stride;
+            Vector256<float> cv0 = Avx.LoadVector256(cp);
+            Vector256<float> cv1 = Avx.LoadVector256(cp + 8);
+            Vector256<float> d0 = Avx.Subtract(qf0, cv0);
+            Vector256<float> d1 = Avx.Subtract(qf1, cv1);
+            d0 = Avx.Multiply(d0, d0);
+            d1 = Avx.Multiply(d1, d1);
+            Vector256<float> sum256 = Avx.Add(d0, d1);
+            // Horizontal sum: 8 floats → 1
+            Vector128<float> lo = sum256.GetLower();
+            Vector128<float> hi = sum256.GetUpper();
+            Vector128<float> sum128 = Sse.Add(lo, hi);
+            sum128 = Sse.Add(sum128, Sse.MoveHighToLow(sum128, sum128));
+            sum128 = Sse.AddScalar(sum128, Sse.Shuffle(sum128, sum128, 0x01));
+            float dist = sum128.ToScalar();
+
             if (dist < probeDist[nprobe - 1])
             {
                 int pos = nprobe - 1;
@@ -339,7 +361,21 @@ public unsafe class FraudDetector
                     for (int p = 0; p < nprobe; p++) { if (probeIdx[p] == c) { already = true; break; } }
                     if (already) continue;
 
-                    float dist = DistByCentroidFloat(query, centroids, c);
+                    float* cp = centroids + c * DataLoader.Stride;
+                    Vector256<float> cv0 = Avx.LoadVector256(cp);
+                    Vector256<float> cv1 = Avx.LoadVector256(cp + 8);
+                    Vector256<float> dd0 = Avx.Subtract(qf0, cv0);
+                    Vector256<float> dd1 = Avx.Subtract(qf1, cv1);
+                    dd0 = Avx.Multiply(dd0, dd0);
+                    dd1 = Avx.Multiply(dd1, dd1);
+                    Vector256<float> s256 = Avx.Add(dd0, dd1);
+                    Vector128<float> slo = s256.GetLower();
+                    Vector128<float> shi = s256.GetUpper();
+                    Vector128<float> s128 = Sse.Add(slo, shi);
+                    s128 = Sse.Add(s128, Sse.MoveHighToLow(s128, s128));
+                    s128 = Sse.AddScalar(s128, Sse.Shuffle(s128, s128, 0x01));
+                    float dist = s128.ToScalar();
+
                     if (dist < extraDist[maxProbe - 1])
                     {
                         int pos = maxProbe - 1;
