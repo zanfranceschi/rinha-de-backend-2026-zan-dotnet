@@ -5,7 +5,7 @@ x-api: &api
   deploy:
     resources:
       limits:
-        cpus: "0.4"
+        cpus: "0.35"
         memory: "160M"
 
 services:
@@ -16,7 +16,7 @@ services:
       NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: true
+      INSTRUMENTED: false
       Logging__LogLevel__Default: None
 
   api2:
@@ -26,7 +26,7 @@ services:
       NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: true
+      INSTRUMENTED: false
       Logging__LogLevel__Default: None
 
   nginx:
@@ -42,7 +42,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.3"
           memory: "30M"
 
 volumes:
