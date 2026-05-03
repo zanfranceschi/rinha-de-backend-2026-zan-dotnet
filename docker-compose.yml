@@ -27,12 +27,12 @@ services:
       KNN_K: 5
       Logging__LogLevel__Default: None
 
-  haproxy:
-    image: haproxy:alpine
+  nginx:
+    image: nginx:alpine
     ports:
       - "9999:9999"
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf
       - sock:/run/sock
     depends_on:
       - api1
