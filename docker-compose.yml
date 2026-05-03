@@ -13,7 +13,7 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
-      NPROBE: 8
+      NPROBE: 1
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
       INSTRUMENTED: false
@@ -23,7 +23,7 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
-      NPROBE: 8
+      NPROBE: 1
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
       INSTRUMENTED: false
