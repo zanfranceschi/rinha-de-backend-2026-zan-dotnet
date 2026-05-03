@@ -309,26 +309,9 @@ public unsafe class FraudDetector
 
             int clusterStart = offsets[clusterId];
             int clusterEnd = offsets[clusterId + 1];
-            int size = clusterEnd - clusterStart;
-            distComps += size;
+            distComps += clusterEnd - clusterStart;
 
-            for (int i = clusterStart; i < clusterEnd; i++)
-            {
-                long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
-                long dist = 0;
-                bool pruned = false;
-
-                for (int di = 0; di < DataLoader.Dim; di++)
-                {
-                    int d = DimOrder[di];
-                    long diff = query[d] - dims[d][i];
-                    dist += diff * diff;
-                    if (dist > worstD) { pruned = true; break; }
-                }
-
-                if (!pruned)
-                    InsertTopK(bestD, bestId, ref found, i, dist, k);
-            }
+            ScanClusterSimd(query, dims, clusterStart, clusterEnd, bestD, bestId, ref found, k);
         }
 
         long t2 = Stopwatch.GetTimestamp();
@@ -382,23 +365,7 @@ public unsafe class FraudDetector
                     int clusterEnd = offsets[clusterId + 1];
                     distComps += clusterEnd - clusterStart;
 
-                    for (int i = clusterStart; i < clusterEnd; i++)
-                    {
-                        long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
-                        long dist = 0;
-                        bool pruned = false;
-
-                        for (int di = 0; di < DataLoader.Dim; di++)
-                        {
-                            int d = DimOrder[di];
-                            long diff = query[d] - dims[d][i];
-                            dist += diff * diff;
-                            if (dist > worstD) { pruned = true; break; }
-                        }
-
-                        if (!pruned)
-                            InsertTopK(bestD, bestId, ref found, i, dist, k);
-                    }
+                    ScanClusterSimd(query, dims, clusterStart, clusterEnd, bestD, bestId, ref found, k);
                 }
 
                 retryTicks = Stopwatch.GetTimestamp() - t2;
@@ -429,6 +396,81 @@ public unsafe class FraudDetector
         for (int i = 0; i < found; i++)
             fraudCount += labels[bestId[i]];
         return fraudCount;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ScanClusterSimd(
+        ReadOnlySpan<short> query, short*[] dims, int clusterStart, int clusterEnd,
+        Span<long> bestD, Span<int> bestId, ref int found, int k)
+    {
+        int i = clusterStart;
+        int simdEnd = clusterStart + ((clusterEnd - clusterStart) & ~15); // round down to 16
+
+        // Process 16 vectors at a time
+        for (; i < simdEnd; i += 16)
+        {
+            // Accumulators for 16 vectors (two groups of 8 as int32)
+            Vector256<int> accLo = Vector256<int>.Zero;
+            Vector256<int> accHi = Vector256<int>.Zero;
+
+            for (int d = 0; d < DataLoader.Dim; d++)
+            {
+                // Broadcast query[d] to all 16 lanes
+                Vector256<short> qv = Vector256.Create(query[d]);
+                // Load 16 consecutive values for dimension d
+                Vector256<short> dv = Avx2.LoadVector256(dims[d] + i);
+                // diff = query - data
+                Vector256<short> diff = Avx2.Subtract(qv, dv);
+
+                // Widen to int32 and square-accumulate
+                // Lower 8 shorts → 8 int32
+                Vector256<int> diffLo = Avx2.ConvertToVector256Int32(diff.GetLower());
+                accLo = Avx2.Add(accLo, Avx2.MultiplyLow(diffLo, diffLo));
+
+                // Upper 8 shorts → 8 int32
+                Vector256<int> diffHi = Avx2.ConvertToVector256Int32(diff.GetUpper());
+                accHi = Avx2.Add(accHi, Avx2.MultiplyLow(diffHi, diffHi));
+            }
+
+            // Extract and check each of the 16 distances
+            long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
+
+            for (int j = 0; j < 8; j++)
+            {
+                long dist = (uint)accLo.GetElement(j);
+                if (dist < worstD)
+                {
+                    InsertTopK(bestD, bestId, ref found, i + j, dist, k);
+                    worstD = found >= k ? bestD[k - 1] : long.MaxValue;
+                }
+            }
+            for (int j = 0; j < 8; j++)
+            {
+                long dist = (uint)accHi.GetElement(j);
+                if (dist < worstD)
+                {
+                    InsertTopK(bestD, bestId, ref found, i + 8 + j, dist, k);
+                    worstD = found >= k ? bestD[k - 1] : long.MaxValue;
+                }
+            }
+        }
+
+        // Scalar tail for remaining vectors
+        for (; i < clusterEnd; i++)
+        {
+            long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
+            long dist = 0;
+
+            for (int d = 0; d < DataLoader.Dim; d++)
+            {
+                long diff = query[d] - dims[d][i];
+                dist += diff * diff;
+                if (dist > worstD) goto nextTail;
+            }
+
+            InsertTopK(bestD, bestId, ref found, i, dist, k);
+            nextTail:;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
