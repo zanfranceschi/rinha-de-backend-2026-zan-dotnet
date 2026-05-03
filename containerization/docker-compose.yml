@@ -6,7 +6,7 @@ x-api: &api
   deploy:
     resources:
       limits:
-        cpus: "0.4"
+        cpus: "0.3"
         memory: "150M"
 
 services:
@@ -14,7 +14,7 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
-      NPROBE: 1
+      NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
       Logging__LogLevel__Default: None
@@ -24,7 +24,7 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
-      NPROBE: 1
+      NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
       Logging__LogLevel__Default: None
@@ -45,7 +45,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.4"
           memory: "50M"
 
 volumes:
