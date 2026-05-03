@@ -50,8 +50,8 @@ Console.WriteLine($"Building IVF index (N={total}, nClusters={nClusters})...");
 var watch = System.Diagnostics.Stopwatch.StartNew();
 
 // K-Means on sample, then assign all vectors
-var sampleSize = Math.Min(trainSample, total);
-Console.WriteLine($"Training KMeans on sample of {sampleSize} vectors, {trainIters} iters...");
+var sampleSize = trainSample == 0 ? total : Math.Min(trainSample, total);
+Console.WriteLine($"Training KMeans on {(sampleSize == total ? "all" : $"sample of {sampleSize}")} vectors, {trainIters} iters...");
 var clusterCentroids = KMeansShort(vectors, total, nClusters, trainIters, sampleSize);
 
 // Assign each vector to nearest centroid

@@ -14,8 +14,10 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api1.sock
-      NPROBE: 20
-      INSTRUMENTED: "false"
+      NPROBE: 10
+      NPROBE_RETRY_EXTRA: 75
+      KNN_K: 5
+      INSTRUMENTED: "true"
       Logging__LogLevel__Default: None
     cpuset: "0,1"
 
@@ -23,8 +25,10 @@ services:
     <<: *api
     environment:
       SOCKET_PATH: /run/sock/api2.sock
-      NPROBE: 20
-      INSTRUMENTED: "false"
+      NPROBE: 10
+      NPROBE_RETRY_EXTRA: 75
+      KNN_K: 5
+      INSTRUMENTED: "true"
       Logging__LogLevel__Default: None
     cpuset: "2,3"
 

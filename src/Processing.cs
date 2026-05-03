@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -194,6 +195,8 @@ public unsafe class FraudDetector
     private static readonly int[] DimOrder = { 5, 6, 2, 0, 7, 8, 11, 12, 9, 10, 1, 13, 3, 4 };
 
     public int NProbe { get; }
+    public int NProbeRetryExtra { get; }
+    public int K { get; }
     public bool Instrumented { get; }
 
     public static readonly byte[][] PrecomputedResponses = BuildResponses();
@@ -211,6 +214,12 @@ public unsafe class FraudDetector
 
         var nprobeEnv = Environment.GetEnvironmentVariable("NPROBE");
         NProbe = nprobeEnv != null ? int.Parse(nprobeEnv) : 8;
+
+        var retryEnv = Environment.GetEnvironmentVariable("NPROBE_RETRY_EXTRA");
+        NProbeRetryExtra = retryEnv != null ? int.Parse(retryEnv) : 100;
+
+        var kEnv = Environment.GetEnvironmentVariable("KNN_K");
+        K = kEnv != null ? int.Parse(kEnv) : DataLoader.K;
 
         Instrumented = string.Equals(Environment.GetEnvironmentVariable("INSTRUMENTED"), "true", StringComparison.OrdinalIgnoreCase);
 
@@ -231,19 +240,28 @@ public unsafe class FraudDetector
 
     public int FraudCount(FraudRequest req)
     {
+        long tv0 = Stopwatch.GetTimestamp();
         Span<short> query = stackalloc short[DataLoader.Stride];
         Vectorizer.Vectorize(req, Data.Normalization, Data.MccRisk, query);
+        long tv1 = Stopwatch.GetTimestamp();
+        if (Instrumented)
+            Interlocked.Add(ref _sVectorizeTicks, tv1 - tv0);
         return SearchKnn(query);
     }
 
     private static long _sDistComps;
     private static long _sSearchCalls;
+    private static long _sCentroidTicks;
+    private static long _sClusterScanTicks;
+    private static long _sRetryTicks;
+    private static long _sRetryCount;
+    private static long _sVectorizeTicks;
 
     public int SearchKnn(ReadOnlySpan<short> query)
     {
         int nClusters = _nClusters;
         int nprobe = Math.Min(NProbe, nClusters);
-        int k = DataLoader.K;
+        int k = K;
         var labels = _labels;
         float* centroids = _centroids;
         short* bboxMin = _bboxMin;
@@ -251,7 +269,9 @@ public unsafe class FraudDetector
         int* offsets = _offsets;
         var dims = _dims;
 
-        // Find nprobe closest centroids (float centroids)
+        long t0 = Stopwatch.GetTimestamp();
+
+        // Find nprobe closest centroids
         Span<float> probeDist = stackalloc float[nprobe];
         Span<int> probeIdx = stackalloc int[nprobe];
         probeDist.Fill(float.MaxValue);
@@ -268,9 +288,12 @@ public unsafe class FraudDetector
             }
         }
 
+        long t1 = Stopwatch.GetTimestamp();
+
         // Search vectors in the nprobe closest clusters
-        Span<long> bestD = stackalloc long[5] { long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue, long.MaxValue };
-        Span<int> bestId = stackalloc int[5];
+        Span<long> bestD = stackalloc long[k];
+        bestD.Fill(long.MaxValue);
+        Span<int> bestId = stackalloc int[k];
         int found = 0;
         int distComps = 0;
 
@@ -278,7 +301,6 @@ public unsafe class FraudDetector
         {
             int clusterId = probeIdx[p];
 
-            // Bbox pruning: skip cluster if lower bound > worst in top-5
             if (found >= k)
             {
                 long lb = BboxLowerBound(query, bboxMin, bboxMax, clusterId);
@@ -290,7 +312,6 @@ public unsafe class FraudDetector
             int size = clusterEnd - clusterStart;
             distComps += size;
 
-            // Column-major scan with early exit per dimension
             for (int i = clusterStart; i < clusterEnd; i++)
             {
                 long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
@@ -310,13 +331,97 @@ public unsafe class FraudDetector
             }
         }
 
+        long t2 = Stopwatch.GetTimestamp();
+        long retryTicks = 0;
+
+        // If borderline, find extra centroids and continue search
+        int maxProbe = Math.Min(NProbeRetryExtra, nClusters);
+        if (maxProbe > nprobe)
+        {
+            int fc = 0;
+            for (int i = 0; i < found; i++)
+                fc += labels[bestId[i]];
+
+            if (fc is 2 or 3)
+            {
+                // Find maxProbe closest centroids, excluding already-visited ones
+                Span<float> extraDist = stackalloc float[maxProbe];
+                Span<int> extraIdx = stackalloc int[maxProbe];
+                extraDist.Fill(float.MaxValue);
+
+                for (int c = 0; c < nClusters; c++)
+                {
+                    // Skip already probed clusters
+                    bool already = false;
+                    for (int p = 0; p < nprobe; p++) { if (probeIdx[p] == c) { already = true; break; } }
+                    if (already) continue;
+
+                    float dist = DistByCentroidFloat(query, centroids, c);
+                    if (dist < extraDist[maxProbe - 1])
+                    {
+                        int pos = maxProbe - 1;
+                        while (pos > 0 && extraDist[pos - 1] > dist) { extraDist[pos] = extraDist[pos - 1]; extraIdx[pos] = extraIdx[pos - 1]; pos--; }
+                        extraDist[pos] = dist;
+                        extraIdx[pos] = c;
+                    }
+                }
+
+                int extraCount = Math.Min(maxProbe - nprobe, maxProbe);
+                for (int p = 0; p < extraCount; p++)
+                {
+                    if (extraDist[p] == float.MaxValue) break;
+                    int clusterId = extraIdx[p];
+
+                    if (found >= k)
+                    {
+                        long lb = BboxLowerBound(query, bboxMin, bboxMax, clusterId);
+                        if (lb > bestD[k - 1]) continue;
+                    }
+
+                    int clusterStart = offsets[clusterId];
+                    int clusterEnd = offsets[clusterId + 1];
+                    distComps += clusterEnd - clusterStart;
+
+                    for (int i = clusterStart; i < clusterEnd; i++)
+                    {
+                        long worstD = found >= k ? bestD[k - 1] : long.MaxValue;
+                        long dist = 0;
+                        bool pruned = false;
+
+                        for (int di = 0; di < DataLoader.Dim; di++)
+                        {
+                            int d = DimOrder[di];
+                            long diff = query[d] - dims[d][i];
+                            dist += diff * diff;
+                            if (dist > worstD) { pruned = true; break; }
+                        }
+
+                        if (!pruned)
+                            InsertTopK(bestD, bestId, ref found, i, dist, k);
+                    }
+                }
+
+                retryTicks = Stopwatch.GetTimestamp() - t2;
+                Interlocked.Increment(ref _sRetryCount);
+            }
+        }
+
         if (Instrumented)
         {
+            Interlocked.Add(ref _sCentroidTicks, t1 - t0);
+            Interlocked.Add(ref _sClusterScanTicks, t2 - t1);
+            Interlocked.Add(ref _sRetryTicks, retryTicks);
             Interlocked.Add(ref _sDistComps, distComps);
             var n = Interlocked.Increment(ref _sSearchCalls);
             if (n % 100 == 0)
             {
-                Console.WriteLine($"[IVF n={n}] avgDistComps={Interlocked.Read(ref _sDistComps)/n} nprobe={nprobe} (avg/req)");
+                double freq = Stopwatch.Frequency;
+                double avgVec = Interlocked.Read(ref _sVectorizeTicks) / n / freq * 1_000_000;
+                double avgCentroid = Interlocked.Read(ref _sCentroidTicks) / n / freq * 1_000_000;
+                double avgScan = Interlocked.Read(ref _sClusterScanTicks) / n / freq * 1_000_000;
+                long retries = Interlocked.Read(ref _sRetryCount);
+                double avgRetry = retries > 0 ? Interlocked.Read(ref _sRetryTicks) / (double)retries / freq * 1_000_000 : 0;
+                Console.WriteLine($"[IVF n={n}] vec={avgVec:F0}us centroid={avgCentroid:F0}us scan={avgScan:F0}us retry={avgRetry:F0}us(x{retries}) distComps={Interlocked.Read(ref _sDistComps)/n}");
             }
         }
 
