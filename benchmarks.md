@@ -61,6 +61,23 @@ Nprobe=8, bitset no retry.
 Nota: as medições anteriores não incluíam a desserialização (~55µs ocultos no model binding).
 O request real sempre custou ~138µs — agora visível. Próximo alvo: desserialização.
 
+## Com Utf8JsonReader manual (zero-alloc parsing)
+
+Nprobe=8, bitset no retry. Parser manual com Utf8JsonReader + struct flat no stack.
+Elimina 6 records, string[], strings de datas. Única alocação: string do MCC.
+
+| Fase | Tempo médio | % do request |
+|------|-------------|--------------|
+| Desserialização (Utf8JsonReader manual) | ~20 µs | ~21% |
+| Vetorização | ~2 µs | ~2% |
+| Centroid ranking (2048 centróides float) | ~19 µs | ~20% |
+| Cluster scan (~6250 distComps) | ~42 µs | ~43% |
+| Response write | ~10 µs | ~10% |
+| **Total request** | **~97 µs** | **100%** |
+| Retry limítrofe (score 0.4/0.6) | ~60 µs | +62% extra |
+
+Speedup desserialização: **2.75x** (55µs → 20µs)
+
 ## Resumo de evolução
 
 | Etapa | Total medido | Total real estimado |
@@ -69,5 +86,6 @@ O request real sempre custou ~138µs — agora visível. Próximo alvo: desseria
 | +SIMD scan | 124 µs | ~179 µs |
 | +SIMD centroid | 90 µs | ~145 µs |
 | +bypass framework + bitset | 138 µs | **138 µs** (agora real) |
+| +Utf8JsonReader manual | 97 µs | **97 µs** |
 
-O speedup real (ponta-a-ponta) é **~2.4x** (335µs → 138µs).
+O speedup real (ponta-a-ponta) é **~3.5x** (335µs → 97µs).

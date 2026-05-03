@@ -120,36 +120,23 @@ public static class Vectorizer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static DateTime ParseIsoUtc(string s)
-    {
-        int y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
-        int M = (s[5] - '0') * 10 + (s[6] - '0');
-        int d = (s[8] - '0') * 10 + (s[9] - '0');
-        int h = (s[11] - '0') * 10 + (s[12] - '0');
-        int m = (s[14] - '0') * 10 + (s[15] - '0');
-        int sec = (s[17] - '0') * 10 + (s[18] - '0');
-        return new DateTime(y, M, d, h, m, sec, DateTimeKind.Utc);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void Vectorize(FraudRequest req, NormalizationConfig norm,
+    public static void Vectorize(in FraudData req, NormalizationConfig norm,
         Dictionary<string, double> mccRisk, Span<short> output)
     {
-        var requestedAt = ParseIsoUtc(req.Transaction.RequestedAt);
+        var requestedAt = req.RequestedAt;
         var dow = ((int)requestedAt.DayOfWeek + 6) % 7;
 
-        output[0] = Q(Clamp(req.Transaction.Amount / norm.MaxAmount));
-        output[1] = Q(Clamp(req.Transaction.Installments / norm.MaxInstallments));
-        output[2] = Q(Clamp((req.Transaction.Amount / req.Customer.AvgAmount) / norm.AmountVsAvgRatio));
+        output[0] = Q(Clamp(req.TransactionAmount / norm.MaxAmount));
+        output[1] = Q(Clamp(req.Installments / norm.MaxInstallments));
+        output[2] = Q(Clamp((req.TransactionAmount / req.CustomerAvgAmount) / norm.AmountVsAvgRatio));
         output[3] = HourLut[requestedAt.Hour];
         output[4] = DowLut[dow];
 
-        if (req.LastTransaction is not null)
+        if (req.HasLastTransaction)
         {
-            var lastTs = ParseIsoUtc(req.LastTransaction.Timestamp);
-            var minutes = (requestedAt - lastTs).TotalMinutes;
+            var minutes = (requestedAt - req.LastTimestamp).TotalMinutes;
             output[5] = Q(Clamp(minutes / norm.MaxMinutes));
-            output[6] = Q(Clamp(req.LastTransaction.KmFromCurrent / norm.MaxKm));
+            output[6] = Q(Clamp(req.LastKmFromCurrent / norm.MaxKm));
         }
         else
         {
@@ -157,13 +144,13 @@ public static class Vectorizer
             output[6] = (short)-DataLoader.Scale;
         }
 
-        output[7] = Q(Clamp(req.Terminal.KmFromHome / norm.MaxKm));
-        output[8] = Q(Clamp(req.Customer.TxCount24h / norm.MaxTxCount24h));
-        output[9]  = req.Terminal.IsOnline ? (short)DataLoader.Scale : (short)0;
-        output[10] = req.Terminal.CardPresent ? (short)DataLoader.Scale : (short)0;
-        output[11] = req.Customer.KnownMerchants.Contains(req.Merchant.Id) ? (short)0 : (short)DataLoader.Scale;
-        output[12] = Q(mccRisk.GetValueOrDefault(req.Merchant.Mcc, 0.5));
-        output[13] = Q(Clamp(req.Merchant.AvgAmount / norm.MaxMerchantAvgAmount));
+        output[7] = Q(Clamp(req.KmFromHome / norm.MaxKm));
+        output[8] = Q(Clamp(req.TxCount24h / norm.MaxTxCount24h));
+        output[9]  = req.IsOnline ? (short)DataLoader.Scale : (short)0;
+        output[10] = req.CardPresent ? (short)DataLoader.Scale : (short)0;
+        output[11] = req.IsKnownMerchant ? (short)0 : (short)DataLoader.Scale;
+        output[12] = Q(mccRisk.GetValueOrDefault(req.MerchantMcc, 0.5));
+        output[13] = Q(Clamp(req.MerchantAvgAmount / norm.MaxMerchantAvgAmount));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -238,11 +225,11 @@ public unsafe class FraudDetector
         return arr;
     }
 
-    public int FraudCount(FraudRequest req)
+    public int FraudCount(in FraudData req)
     {
         long tv0 = Stopwatch.GetTimestamp();
         Span<short> query = stackalloc short[DataLoader.Stride];
-        Vectorizer.Vectorize(req, Data.Normalization, Data.MccRisk, query);
+        Vectorizer.Vectorize(in req, Data.Normalization, Data.MccRisk, query);
         long tv1 = Stopwatch.GetTimestamp();
         if (Instrumented)
             Interlocked.Add(ref _sVectorizeTicks, tv1 - tv0);

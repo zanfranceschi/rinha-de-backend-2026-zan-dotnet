@@ -7,7 +7,7 @@ x-api: &api
     resources:
       limits:
         cpus: "0.4"
-        memory: "160M"
+        memory: "150M"
 
 services:
   api1:
@@ -17,7 +17,7 @@ services:
       NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: "true"
+      INSTRUMENTED: true
       Logging__LogLevel__Default: None
     cpuset: "0,1"
 
@@ -28,7 +28,7 @@ services:
       NPROBE: 8
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
-      INSTRUMENTED: "true"
+      INSTRUMENTED: true
       Logging__LogLevel__Default: None
     cpuset: "2,3"
 
@@ -48,7 +48,7 @@ services:
       resources:
         limits:
           cpus: "0.2"
-          memory: "30M"
+          memory: "50M"
 
 volumes:
   sock:

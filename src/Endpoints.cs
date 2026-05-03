@@ -1,6 +1,5 @@
+using System.Buffers;
 using System.Diagnostics;
-using System.Text.Json;
-using Rinha2026.Models;
 using Rinha2026.Services;
 
 namespace Rinha2026.Endpoints;
@@ -31,11 +30,25 @@ public static class Endpoints
             {
                 long tStart = Stopwatch.GetTimestamp();
 
-                var req = await JsonSerializer.DeserializeAsync(
-                    ctx.Request.Body, AppJsonContext.Default.FraudRequest);
+                var result = await ctx.Request.BodyReader.ReadAsync();
+                var buffer = result.Buffer;
+                FraudData data;
+                if (buffer.IsSingleSegment)
+                {
+                    data = FraudParser.Parse(buffer.FirstSpan);
+                }
+                else
+                {
+                    int len = (int)buffer.Length;
+                    byte[] rented = ArrayPool<byte>.Shared.Rent(len);
+                    buffer.CopyTo(rented);
+                    data = FraudParser.Parse(rented.AsSpan(0, len));
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+                ctx.Request.BodyReader.AdvanceTo(buffer.End);
                 long tAfterDeserialize = Stopwatch.GetTimestamp();
 
-                var fraudCount = detector.FraudCount(req!);
+                var fraudCount = detector.FraudCount(in data);
                 long tAfterFraud = Stopwatch.GetTimestamp();
 
                 var payload = FraudDetector.PrecomputedResponses[fraudCount];
