@@ -2,3 +2,4 @@
 !docker-compose.yml
 !info.json
 !nginx.conf
+!haproxy.cfg
