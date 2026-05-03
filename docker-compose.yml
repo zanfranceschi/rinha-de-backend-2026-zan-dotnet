@@ -1,5 +1,5 @@
 x-api: &api
-  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202605030527
+  image: zanfranceschi/rinha-de-backend-2026-zan-dotnet:202605030558
   volumes:
     - sock:/run/sock
   deploy:
@@ -17,6 +17,7 @@ services:
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
       Logging__LogLevel__Default: None
+    cpuset: "0,1"
 
   api2:
     <<: *api
@@ -26,6 +27,7 @@ services:
       NPROBE_RETRY_EXTRA: 75
       KNN_K: 5
       Logging__LogLevel__Default: None
+    cpuset: "2,3"
 
   nginx:
     image: nginx:alpine
@@ -37,6 +39,7 @@ services:
     depends_on:
       - api1
       - api2
+    cpuset: "0,2"
     deploy:
       resources:
         limits:
