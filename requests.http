@@ -76,4 +76,4 @@ Content-Type: application/json
 POST http://localhost:{{port}}/fraud-score?nprobe=75
 Content-Type: application/json
 
-{"id":"tx-3468014206","transaction":{"amount":457.52,"installments":5,"requested_at":"2026-03-25T08:08:35Z"},"customer":{"avg_amount":317.96,"tx_count_24h":4,"known_merchants":["MERC-009","MERC-011","MERC-002","MERC-002","MERC-010"]},"merchant":{"id":"MERC-009","mcc":"5411","avg_amount":289.11},"terminal":{"is_online":false,"card_present":true,"km_from_home":168.1178127015},"last_transaction":{"timestamp":"2026-03-25T06:36:35Z","km_from_current":112.32416699}}
+{"id":"tx-2466999149","transaction":{"amount":3558.94,"installments":8,"requested_at":"2026-05-08T04:32:43Z"},"customer":{"avg_amount":127.02,"tx_count_24h":9,"known_merchants":["MERC-016","MERC-014","MERC-016","MERC-018","MERC-016"]},"merchant":{"id":"MERC-093","mcc":"7802","avg_amount":83.74},"terminal":{"is_online":true,"card_present":false,"km_from_home":417.9947114126},"last_transaction":{"timestamp":"2017-03-29T10:43:09Z","km_from_current":337.9725413718}}
