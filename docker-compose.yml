@@ -14,7 +14,7 @@ services:
     environment:
       SOCKET_PATH: /run/sock/api1.sock
       NPROBE: 8
-      NPROBE_RETRY_EXTRA: 75
+      NPROBE_RETRY_EXTRA: 103
       KNN_K: 5
       Logging__LogLevel__Default: None
     cpuset: "0,1"
@@ -24,7 +24,7 @@ services:
     environment:
       SOCKET_PATH: /run/sock/api2.sock
       NPROBE: 8
-      NPROBE_RETRY_EXTRA: 75
+      NPROBE_RETRY_EXTRA: 103
       KNN_K: 5
       Logging__LogLevel__Default: None
     cpuset: "2,3"
